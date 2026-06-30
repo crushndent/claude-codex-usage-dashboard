@@ -2,9 +2,9 @@
 
 An unofficial local dashboard for viewing Claude Code and Codex usage limits on a spare phone, tablet, or small screen.
 
-The server runs on your Windows machine, reads local usage data, and serves a simple dashboard that can be opened from another device on the same Wi-Fi network.
+The server runs on your own Windows or macOS machine, reads local usage data, and serves a simple dashboard that can be opened from another device on the same Wi-Fi network.
 
-![Status](https://img.shields.io/badge/platform-Windows-767FC6)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-767FC6)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-43853D)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
@@ -17,6 +17,7 @@ The server runs on your Windows machine, reads local usage data, and serves a si
 - Tap the dashboard to refresh and request fullscreen mode.
 - Turns red when usage reaches the alert threshold.
 - Uses only Node.js built-in modules. No npm dependencies.
+- Includes helper scripts for Windows and macOS.
 
 ## Important Limitations
 
@@ -26,24 +27,33 @@ Claude Code usage comes from `statusLine`, so opening Claude in the web app or d
 
 This project is not affiliated with Anthropic or OpenAI. It does not include official logos. Make sure your own use of third-party names, trademarks, and local tool output formats follows the relevant terms.
 
+This is a personal side project. Support is best-effort.
+
 ## Requirements
 
-- Windows
+- Windows 10/11 or macOS
 - Node.js 18 or newer
 - Claude Code, with `statusLine` configured for real Claude usage
 - Codex, with local `~/.codex/sessions` data
 
 Check Node.js:
 
-```powershell
+```bash
 node -v
 ```
 
 ## Quick Start
 
-```powershell
-git clone https://github.com/YOUR_NAME/claude-codex-usage-dashboard.git
+Clone the repository:
+
+```bash
+git clone https://github.com/frankchiu-dev/claude-codex-usage-dashboard.git
 cd claude-codex-usage-dashboard
+```
+
+Start the dashboard:
+
+```bash
 node server.js
 ```
 
@@ -54,14 +64,40 @@ Local:  http://localhost:8787
 Device: http://192.168.1.23:8787
 ```
 
-Open `http://localhost:8787` on the Windows machine. To use a phone or tablet, connect it to the same Wi-Fi network and open the `Device` URL.
+Open `http://localhost:8787` on the computer running the server. To use a phone or tablet, connect it to the same Wi-Fi network and open the `Device` URL.
+
+## Start Scripts
+
+### Windows
+
+```powershell
+.\start-dashboard.bat
+```
+
+### macOS
+
+```bash
+chmod +x ./start-dashboard.sh ./start-dashboard.command
+./start-dashboard.sh
+```
+
+You can also double-click `start-dashboard.command` in Finder after making it executable.
 
 ## Configure Claude Code Usage
 
-Run:
+This step lets the dashboard show real Claude Code usage.
+
+### Windows
 
 ```powershell
 .\setup-claude-statusline.bat
+```
+
+### macOS
+
+```bash
+chmod +x ./setup-claude-statusline.sh
+./setup-claude-statusline.sh
 ```
 
 Then:
@@ -79,11 +115,21 @@ Claude Code supports one `statusLine.command` at a time. If you already use anot
 
 Copy the example config:
 
+### Windows
+
 ```powershell
 Copy-Item .\config.example.json .\config.json
 ```
 
-Edit `config.json`:
+### macOS
+
+```bash
+cp ./config.example.json ./config.json
+```
+
+Edit `config.json`.
+
+Windows example:
 
 ```json
 {
@@ -91,15 +137,33 @@ Edit `config.json`:
 }
 ```
 
-Then run:
+macOS example:
+
+```json
+{
+  "extraStatuslineCommand": "/Users/YOUR_NAME/.claude/your-existing-statusline.sh"
+}
+```
+
+Then enable fanout mode.
+
+### Windows
 
 ```powershell
 .\setup-claude-statusline.bat --fanout
 ```
 
+### macOS
+
+```bash
+./setup-claude-statusline.sh --fanout
+```
+
 This sends the same Claude Code statusLine JSON to both this dashboard and your existing command.
 
 ## Start Automatically on Login
+
+### Windows
 
 Install autostart:
 
@@ -111,6 +175,28 @@ Remove autostart:
 
 ```powershell
 .\uninstall-autostart.bat
+```
+
+### macOS
+
+Install a LaunchAgent:
+
+```bash
+chmod +x ./install-autostart-macos.sh ./uninstall-autostart-macos.sh
+./install-autostart-macos.sh
+```
+
+Remove the LaunchAgent:
+
+```bash
+./uninstall-autostart-macos.sh
+```
+
+The macOS LaunchAgent writes logs to:
+
+```text
+~/Library/Logs/claude-codex-usage-dashboard.log
+~/Library/Logs/claude-codex-usage-dashboard.err.log
 ```
 
 ## Environment Variables
@@ -125,7 +211,7 @@ Remove autostart:
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Codex sessions path |
 | `EXTRA_STATUSLINE_COMMAND` | empty | Extra command for fanout mode |
 
-Example:
+Windows example:
 
 ```powershell
 $env:PORT="8790"
@@ -133,13 +219,25 @@ $env:HOST="127.0.0.1"
 node server.js
 ```
 
-## Windows Firewall
+macOS example:
 
-If your phone or tablet cannot connect, allow the dashboard port through Windows Firewall:
+```bash
+PORT=8790 HOST=127.0.0.1 node server.js
+```
+
+## Network Access
+
+If another device cannot connect, make sure it is on the same Wi-Fi network as the computer running the dashboard.
+
+### Windows Firewall
 
 ```powershell
 netsh advfirewall firewall add rule name="AIUsageDashboard" dir=in action=allow protocol=TCP localport=8787
 ```
+
+### macOS Firewall
+
+macOS may ask whether Node.js can accept incoming network connections. Allow it if you want to open the dashboard from a phone or tablet.
 
 ## Privacy
 
