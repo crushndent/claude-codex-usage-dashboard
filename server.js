@@ -129,7 +129,11 @@ async function readClaudeLive(entry, index) {
     }
     provider.source = 'live account API';
     return provider;
-  } catch { return fallback; }
+  } catch (error) {
+    fallback.source = 'local cache fallback';
+    fallback.warning = `Live account API unavailable: ${error.message}`;
+    return fallback;
+  }
 }
 async function readCodexLive(entry, index) {
   const sessionsDir = entry.sessionsDir || paths.codex;
@@ -152,7 +156,11 @@ async function readCodexLive(entry, index) {
     if (provider.extraCredits.balance !== null) provider.overageRemaining = provider.extraCredits.balance;
     provider.source = 'live account API';
     return provider;
-  } catch { return fallback; }
+  } catch (error) {
+    fallback.source = 'local session fallback';
+    fallback.warning = `Live account API unavailable: ${error.message}`;
+    return fallback;
+  }
 }
 async function readOpenRouter(config) {
   const manual = configuredBalance('openrouter', 'OpenRouter', config);
