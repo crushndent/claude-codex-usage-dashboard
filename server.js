@@ -79,7 +79,14 @@ function readCodex(sessionsDir = paths.codex, account = null, index = 0) {
 }
 function readAgyCache() {
   const raw = readJson(paths.agy);
+  if (raw?.kind === 'pools' && Array.isArray(raw.pools)) return raw;
   return raw ? quotaProvider('agy', 'agy', raw, raw.fetchedAt) : unavailable('agy', 'agy', 'quota', `Waiting for ${paths.agy}`);
+}
+function saveAgyCache(provider) {
+  try {
+    fs.mkdirSync(path.dirname(paths.agy), { recursive: true });
+    fs.writeFileSync(paths.agy, JSON.stringify(provider));
+  } catch {}
 }
 
 function execText(command, args) {
@@ -131,7 +138,9 @@ function parseAgyStatus(data) {
 async function readAgy() {
   const fallback = readAgyCache();
   try {
-    const pids = String(await execText('pgrep', ['-x', 'agy'])).trim().split(/\s+/).filter(Boolean);
+    let processList = '';
+    try { processList = String(await execText('pgrep', ['-x', 'agy'])); } catch {}
+    const pids = processList.trim().split(/\s+/).filter(Boolean);
     if (!pids.length) throw new Error('agy is not running');
     const sockets = String(await execText('ss', ['-tlnp']));
     const ports = [];
@@ -143,10 +152,18 @@ async function readAgy() {
     const route = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
     const body = { metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' } };
     for (const port of ports) for (const secure of [true, false]) {
-      try { return parseAgyStatus(await postLocalJson(port, secure, route, body)); } catch {}
+      try {
+        const provider = parseAgyStatus(await postLocalJson(port, secure, route, body));
+        saveAgyCache(provider);
+        return provider;
+      } catch {}
     }
     throw new Error('no responsive agy quota port');
-  } catch (error) { fallback.warning = `Live agy API unavailable: ${error.message}`; return fallback; }
+  } catch (error) {
+    fallback.warning = error.message;
+    if (fallback.status !== 'unavailable') fallback.source = 'last live agy snapshot';
+    return fallback;
+  }
 }
 
 function configuredBalance(id, name, config) {
