@@ -28,7 +28,7 @@ function epoch(value) {
 }
 function quotaWindow(value) {
   if (!value) return null;
-  const used = value.used_percentage ?? value.used_percent ?? value.used;
+  const used = value.used_percentage ?? value.used_percent ?? value.utilization ?? value.used;
   const remaining = value.remaining_percentage ?? value.remaining_percent ?? value.remaining;
   const usedPercent = Number.isFinite(Number(used)) ? clamp(used) :
     Number.isFinite(Number(remaining)) ? clamp(100 - remaining) : null;
@@ -39,17 +39,20 @@ function quotaProvider(id, name, raw, fetchedAt, account = null) {
   const limits = raw?.rate_limits || raw?.rateLimits || raw?.quota || raw || {};
   return {
     id, name, account, kind: 'quota', fetchedAt: epoch(fetchedAt ?? raw?.fetchedAt ?? raw?.updated_at),
-    five: quotaWindow(limits.five_hour ?? limits.fiveHour ?? limits.primary ?? limits.session),
-    weekly: quotaWindow(limits.seven_day ?? limits.sevenDay ?? limits.weekly ?? limits.secondary),
+    five: quotaWindow(limits.five_hour ?? limits.fiveHour ?? limits.primary ?? limits.primary_window ?? limits.session),
+    weekly: quotaWindow(limits.seven_day ?? limits.sevenDay ?? limits.weekly ?? limits.secondary ?? limits.secondary_window),
   };
 }
 function unavailable(id, name, kind, detail, account = null) { return { id, name, account, kind, status: 'unavailable', detail }; }
 
 function accountId(tool, account, index) { return `${tool}-${String(account || index + 1).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`; }
-function readClaude(cachePath = paths.claude, account = null, index = 0) {
+function readClaude(cachePath = paths.claude, account = null, index = 0, overageRemaining = null) {
   const raw = readJson(cachePath);
   const id = accountId('claude', account, index);
-  return raw ? quotaProvider(id, 'Claude', raw, raw.fetchedAt, account) : unavailable(id, 'Claude', 'quota', `Waiting for ${cachePath}`, account);
+  const provider = raw ? quotaProvider(id, 'Claude', raw, raw.fetchedAt, account) : unavailable(id, 'Claude', 'quota', `Waiting for ${cachePath}`, account);
+  const balance = Number(overageRemaining);
+  if (overageRemaining !== null && overageRemaining !== '' && Number.isFinite(balance)) provider.overageRemaining = balance;
+  return provider;
 }
 
 function codexDay(date, sessionsDir = paths.codex) {
@@ -90,10 +93,47 @@ function fetchJson(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = require('https').get(url, { headers, timeout: 8000 }, (res) => {
       let body = ''; res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => { try { resolve(JSON.parse(body)); } catch (error) { reject(error); } });
+      res.on('end', () => { if (res.statusCode < 200 || res.statusCode >= 300) return reject(new Error(`HTTP ${res.statusCode}`)); try { resolve(JSON.parse(body)); } catch (error) { reject(error); } });
     });
     req.on('timeout', () => req.destroy(new Error('timeout'))); req.on('error', reject);
   });
+}
+async function readClaudeLive(entry, index) {
+  const fallback = readClaude(entry.cache, entry.email, index, entry.overageRemaining);
+  const credentials = entry.credentials || path.join(path.dirname(entry.cache), '.credentials.json');
+  const token = readJson(credentials)?.claudeAiOauth?.accessToken;
+  if (!token) return fallback;
+  try {
+    const raw = await fetchJson('https://api.anthropic.com/api/oauth/usage', {
+      Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'claude-code/2.1.206',
+    });
+    const provider = quotaProvider(accountId('claude', entry.email, index), 'Claude', raw, Date.now(), entry.email);
+    const extra = raw.extra_usage;
+    if (extra?.is_enabled && Number.isFinite(Number(extra.monthly_limit)) && Number.isFinite(Number(extra.used_credits))) {
+      const scale = 10 ** Number(extra.decimal_places || 0);
+      provider.overageRemaining = Math.max(0, (Number(extra.monthly_limit) - Number(extra.used_credits)) / scale);
+    }
+    provider.source = 'live account API';
+    return provider;
+  } catch { return fallback; }
+}
+async function readCodexLive(entry, index) {
+  const sessionsDir = entry.sessionsDir || paths.codex;
+  const fallback = readCodex(sessionsDir, entry.email, index);
+  const auth = readJson(entry.authFile || path.join(path.dirname(sessionsDir), 'auth.json'));
+  const token = auth?.tokens?.access_token;
+  const accountIdHeader = auth?.tokens?.account_id;
+  if (!token) return fallback;
+  try {
+    const headers = { Authorization: `Bearer ${token}` };
+    if (accountIdHeader) headers['ChatGPT-Account-Id'] = accountIdHeader;
+    const raw = await fetchJson('https://chatgpt.com/backend-api/wham/usage', headers);
+    const label = entry.email || raw.email || null;
+    const provider = quotaProvider(accountId('codex', label, index), 'Codex', raw.rate_limit, Date.now(), label);
+    if (raw.credits?.has_credits && Number.isFinite(Number(raw.credits.balance))) provider.overageRemaining = Number(raw.credits.balance);
+    provider.source = 'live account API';
+    return provider;
+  } catch { return fallback; }
 }
 async function readOpenRouter(config) {
   const manual = configuredBalance('openrouter', 'OpenRouter', config);
@@ -124,11 +164,15 @@ let cache = { at: 0, data: null };
 async function usage() {
   if (cache.data && Date.now() - cache.at < 8000) return cache.data;
   const config = readJson(paths.config) || {};
-  const claudeAccounts = Array.isArray(config?.accounts?.claude) && config.accounts.claude.length
-    ? config.accounts.claude.map((entry, index) => readClaude(entry.cache, entry.email, index)) : [readClaude()];
-  const codexAccounts = Array.isArray(config?.accounts?.codex) && config.accounts.codex.length
-    ? config.accounts.codex.map((entry, index) => readCodex(entry.sessionsDir, entry.email, index)) : [readCodex()];
-  const providers = [readAgy(), ...codexAccounts, ...claudeAccounts, await readOpenRouter(config), await readKilo(config)];
+  const claudeEntries = Array.isArray(config?.accounts?.claude) && config.accounts.claude.length
+    ? config.accounts.claude : [{ cache: paths.claude }];
+  const codexEntries = Array.isArray(config?.accounts?.codex) && config.accounts.codex.length
+    ? config.accounts.codex : [{ sessionsDir: paths.codex }];
+  const claudeAccounts = await Promise.all(claudeEntries.map(readClaudeLive));
+  const codexAccounts = await Promise.all(codexEntries.map(readCodexLive));
+  const anthropicApi = configuredBalance('anthropicApi', 'Anthropic API', config)
+    || unavailable('anthropicApi', 'Anthropic API', 'balance', 'Add the current API balance to config.json');
+  const providers = [readAgy(), ...codexAccounts, ...claudeAccounts, anthropicApi, await readOpenRouter(config), await readKilo(config)];
   cache = { at: Date.now(), data: { generatedAt: Date.now(), refreshMs: REFRESH_MS, providers } };
   return cache.data;
 }

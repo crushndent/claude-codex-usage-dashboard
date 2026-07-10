@@ -5,12 +5,24 @@ A private, dependency-free local dashboard for remaining LLM capacity.
 | Tool | Display | Source |
 | --- | --- | --- |
 | agy | 5-hour + weekly remaining | Flexible local cache (`~/.cache/agy/usage.json`) |
-| Codex | 5-hour + weekly remaining | Latest `rate_limits` event in `~/.codex/sessions` |
-| Claude | 5-hour + weekly remaining | Claude status-line cache |
+| Codex | 5-hour + weekly remaining | Live client account API; sessions fallback |
+| Claude | 5-hour + weekly remaining | Live client account API; status-line fallback |
+| Claude overage | Credits remaining per account | Local `config.json` balance |
+| Anthropic API | API balance remaining | Local `config.json` balance |
 | OpenRouter | Credits remaining | Official `/api/v1/credits` endpoint |
 | Kilo Code | Credits remaining | `kilo profile --json`, with config fallback |
 
-The dashboard never sends local Claude, Codex, or agy session data anywhere.
+The dashboard polls the same authenticated account-usage endpoints used by the
+installed Claude and Codex clients. OAuth credentials are read in memory from
+each profile, never returned to the browser, logged, or copied into config.
+Local session/status-line data remains a fallback if an endpoint or token is
+temporarily unavailable. These client-internal endpoints are not guaranteed
+stable public APIs.
+
+Claude subscription status does not expose overage balances, and a regular
+Anthropic API key cannot query billing balance. Set `overageRemaining` on each
+Claude account and `providers.anthropicApi.remaining` in the ignored
+`config.json`. These amounts are intentionally local and manually maintained.
 
 ## Start
 

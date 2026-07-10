@@ -2,8 +2,8 @@
   "extraStatuslineCommand": "",
   "accounts": {
     "claude": [
-      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json" },
-      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json" }
+      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json", "overageRemaining": 10.00 },
+      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json", "overageRemaining": 25.00 }
     ],
     "codex": [
       { "email": "personal@example.com", "sessionsDir": "/home/you/.codex-personal/sessions" },
@@ -11,6 +11,7 @@
     ]
   },
   "providers": {
+    "anthropicApi": { "remaining": 50.00, "unit": "USD" },
     "kilo": { "remaining": 12.50, "unit": "USD" },
     "openrouter": { "remaining": 20.00, "unit": "USD" }
   }
