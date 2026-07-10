@@ -77,9 +77,76 @@ function readCodex(sessionsDir = paths.codex, account = null, index = 0) {
   const id = accountId('codex', account, index);
   return newest ? quotaProvider(id, 'Codex', newest.limits, newest.at, account) : unavailable(id, 'Codex', 'quota', `No rate-limit snapshot in ${sessionsDir}`, account);
 }
-function readAgy() {
+function readAgyCache() {
   const raw = readJson(paths.agy);
   return raw ? quotaProvider('agy', 'agy', raw, raw.fetchedAt) : unavailable('agy', 'agy', 'quota', `Waiting for ${paths.agy}`);
+}
+
+function execText(command, args) {
+  return new Promise((resolve, reject) => execFile(command, args, { timeout: 4000 }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+}
+function postLocalJson(port, secure, route, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const lib = secure ? require('https') : require('http');
+    const req = lib.request({ hostname: '127.0.0.1', port, path: route, method: 'POST', rejectUnauthorized: false, timeout: 3000,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Connect-Protocol-Version': '1' } }, (res) => {
+      let text = ''; res.on('data', (chunk) => { text += chunk; });
+      res.on('end', () => { if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`)); try { resolve(JSON.parse(text)); } catch (error) { reject(error); } });
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout'))); req.on('error', reject); req.end(payload);
+  });
+}
+function agyPoolName(models) {
+  const text = models.map((m) => `${m.label || ''} ${m.modelOrAlias?.model || ''}`.toLowerCase()).join(' ');
+  const parts = [];
+  if (/gemini.*pro|pro.*gemini/.test(text)) parts.push('Gemini Pro');
+  if (/gemini.*flash|flash.*gemini/.test(text)) parts.push('Gemini Flash');
+  if (/claude/.test(text)) parts.push('Claude');
+  if (/gpt|openai/.test(text)) parts.push('GPT');
+  return parts.length ? [...new Set(parts)].join(' · ') : (models[0]?.label || 'Model pool');
+}
+function parseAgyStatus(data) {
+  const status = data?.userStatus || {};
+  const models = status.cascadeModelConfigData?.clientModelConfigs || [];
+  const grouped = new Map();
+  for (const model of models) {
+    const quota = model.quotaInfo || model.quota_info;
+    if (!quota || !Number.isFinite(Number(quota.remainingFraction ?? quota.remaining_fraction))) continue;
+    const remaining = clamp(Number(quota.remainingFraction ?? quota.remaining_fraction) * 100);
+    const resetAt = epoch(quota.resetTime ?? quota.reset_time);
+    const key = `${remaining}|${resetAt}`;
+    if (!grouped.has(key)) grouped.set(key, { remainingPercent: remaining, resetAt, models: [] });
+    grouped.get(key).models.push(model);
+  }
+  const pools = [...grouped.values()].map((pool) => ({ ...pool, name: agyPoolName(pool.models), models: pool.models.map((m) => m.label || m.modelOrAlias?.model).filter(Boolean) }));
+  const plan = status.planStatus || {};
+  const monthly = Number(plan.planInfo?.monthlyPromptCredits);
+  const available = Number(plan.availablePromptCredits);
+  return { id: 'agy', name: 'agy', account: status.email || null, kind: 'pools', fetchedAt: Date.now(), source: 'live agy local API', pools,
+    promptCredits: Number.isFinite(available) ? { remaining: available, monthly: Number.isFinite(monthly) ? monthly : null } : null,
+    aiCredits: (status.userTier?.availableCredits || []).map((credit) => ({ type: credit.creditType, amount: Number(credit.creditAmount) }))
+      .filter((credit) => Number.isFinite(credit.amount)) };
+}
+async function readAgy() {
+  const fallback = readAgyCache();
+  try {
+    const pids = String(await execText('pgrep', ['-x', 'agy'])).trim().split(/\s+/).filter(Boolean);
+    if (!pids.length) throw new Error('agy is not running');
+    const sockets = String(await execText('ss', ['-tlnp']));
+    const ports = [];
+    for (const line of sockets.split('\n')) {
+      if (!pids.some((pid) => line.includes(`pid=${pid}`))) continue;
+      const match = line.trim().split(/\s+/)[3]?.match(/:(\d+)$/);
+      if (match && !ports.includes(Number(match[1]))) ports.push(Number(match[1]));
+    }
+    const route = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+    const body = { metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' } };
+    for (const port of ports) for (const secure of [true, false]) {
+      try { return parseAgyStatus(await postLocalJson(port, secure, route, body)); } catch {}
+    }
+    throw new Error('no responsive agy quota port');
+  } catch (error) { fallback.warning = `Live agy API unavailable: ${error.message}`; return fallback; }
 }
 
 function configuredBalance(id, name, config) {
@@ -201,7 +268,7 @@ async function usage() {
     || unavailable('anthropicApi', 'Anthropic API', 'balance', 'Add the current API balance to config.json');
   const kilo = await readKilo(config);
   const openRouter = await readOpenRouter(config);
-  const providers = [...claudeAccounts, ...codexAccounts, kilo, openRouter, anthropicApi, readAgy()];
+  const providers = [...claudeAccounts, ...codexAccounts, kilo, openRouter, anthropicApi, await readAgy()];
   cache = { at: Date.now(), data: { generatedAt: Date.now(), refreshMs: REFRESH_MS, providers } };
   return cache.data;
 }

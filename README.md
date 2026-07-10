@@ -4,7 +4,7 @@ A private, dependency-free local dashboard for remaining LLM capacity.
 
 | Tool | Display | Source |
 | --- | --- | --- |
-| agy | 5-hour + weekly remaining | Flexible local cache (`~/.cache/agy/usage.json`) |
+| agy / Antigravity | Per-model pool quotas, resets, prompt and AI credits | Live read-only `agy` localhost API; cache fallback |
 | Codex | 5-hour + weekly remaining | Live client account API; sessions fallback |
 | Claude | 5-hour + weekly remaining | Live client account API; status-line fallback |
 | Claude overage | Credits remaining per account | Local `config.json` balance |
@@ -18,6 +18,13 @@ each profile, never returned to the browser, logged, or copied into config.
 Local session/status-line data remains a fallback if an endpoint or token is
 temporarily unavailable. These client-internal endpoints are not guaranteed
 stable public APIs.
+
+For agy, the server discovers the running `agy` process and its localhost
+listening ports, then calls the read-only Antigravity Connect RPC
+`GetUserStatus`. Models sharing the same remaining fraction and reset time are
+deduplicated into one quota pool. This follows the independently implemented
+approach used by `antigravity-usage`, `antigravity-usage-checker`, and
+`antigravity-pulse`; no Google or Antigravity token is copied into this project.
 
 Claude subscription status does not expose overage balances, and a regular
 Anthropic API key cannot query billing balance. Set `overageRemaining` on each
