@@ -5,7 +5,10 @@ const path = require('path');
 const os = require('os');
 
 const useFanout = process.argv.includes('--fanout');
-const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+function arg(name) { const index = process.argv.indexOf(name); return index >= 0 ? process.argv[index + 1] : null; }
+const configDir = arg('--config-dir') || path.join(os.homedir(), '.claude');
+const cachePath = arg('--cache') || path.join(configDir, 'usage-cache.json');
+const settingsPath = path.join(configDir, 'settings.json');
 const scriptName = useFanout ? 'statusline-both.js' : 'statusline-usage.js';
 const scriptPath = path.join(__dirname, scriptName);
 
@@ -19,7 +22,7 @@ function backupPathFor(filePath) {
 }
 
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
-  console.log('Usage: node setup-statusline.js [--fanout]');
+  console.log('Usage: node setup-statusline.js [--fanout] [--config-dir DIR] [--cache FILE]');
   console.log('');
   console.log('--fanout  Use statusline-both.js so this dashboard can coexist with another statusLine command.');
   process.exit(0);
@@ -44,7 +47,7 @@ if (fs.existsSync(settingsPath)) {
   }
 }
 
-const command = quote(process.execPath) + ' ' + quote(scriptPath);
+const command = quote(process.execPath) + ' ' + quote(scriptPath) + ' --cache ' + quote(cachePath);
 settings.statusLine = {
   type: 'command',
   command,

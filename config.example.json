@@ -1,5 +1,15 @@
 {
   "extraStatuslineCommand": "",
+  "accounts": {
+    "claude": [
+      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json" },
+      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json" }
+    ],
+    "codex": [
+      { "email": "personal@example.com", "sessionsDir": "/home/you/.codex-personal/sessions" },
+      { "email": "work@example.com", "sessionsDir": "/home/you/.codex-work/sessions" }
+    ]
+  },
   "providers": {
     "kilo": { "remaining": 12.50, "unit": "USD" },
     "openrouter": { "remaining": 20.00, "unit": "USD" }

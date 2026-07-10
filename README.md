@@ -32,6 +32,29 @@ included capture command, restart Claude, and send one message:
 npm run setup:claude
 ```
 
+### Multiple Claude accounts
+
+Each account needs its own Claude config directory and dashboard cache. Configure
+the status line once per account:
+
+```bash
+node setup-statusline.js --config-dir "$HOME/.claude-personal" --cache "$HOME/.claude-personal/usage-cache.json"
+node setup-statusline.js --config-dir "$HOME/.claude-work" --cache "$HOME/.claude-work/usage-cache.json"
+```
+
+Then add both entries under `accounts.claude` in `config.json` (see
+`config.example.json`). Start each Claude account with its matching
+`CLAUDE_CONFIG_DIR`, restart Claude, and send one message. The dashboard card
+shows the configured email as a subheader; the email is a label and is not read
+from authentication tokens.
+
+### Multiple Codex accounts
+
+Codex rate-limit events do not reliably contain an account email. Keep each
+account in a separate `CODEX_HOME`, then add each corresponding `sessions`
+directory under `accounts.codex` in `config.json`. The dashboard will render a
+separate card and email subheader for each account.
+
 If a status line is already configured, use `npm run setup:claude:fanout` and
 set `extraStatuslineCommand` in `config.json` as documented in
 `config.example.json` from the upstream project history.

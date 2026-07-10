@@ -35,28 +35,30 @@ function quotaWindow(value) {
   if (usedPercent === null) return null;
   return { usedPercent, remainingPercent: 100 - usedPercent, resetAt: epoch(value.resets_at ?? value.reset_at ?? value.resetAt) };
 }
-function quotaProvider(id, name, raw, fetchedAt) {
+function quotaProvider(id, name, raw, fetchedAt, account = null) {
   const limits = raw?.rate_limits || raw?.rateLimits || raw?.quota || raw || {};
   return {
-    id, name, kind: 'quota', fetchedAt: epoch(fetchedAt ?? raw?.fetchedAt ?? raw?.updated_at),
+    id, name, account, kind: 'quota', fetchedAt: epoch(fetchedAt ?? raw?.fetchedAt ?? raw?.updated_at),
     five: quotaWindow(limits.five_hour ?? limits.fiveHour ?? limits.primary ?? limits.session),
     weekly: quotaWindow(limits.seven_day ?? limits.sevenDay ?? limits.weekly ?? limits.secondary),
   };
 }
-function unavailable(id, name, kind, detail) { return { id, name, kind, status: 'unavailable', detail }; }
+function unavailable(id, name, kind, detail, account = null) { return { id, name, account, kind, status: 'unavailable', detail }; }
 
-function readClaude() {
-  const raw = readJson(paths.claude);
-  return raw ? quotaProvider('claude', 'Claude', raw, raw.fetchedAt) : unavailable('claude', 'Claude', 'quota', 'Run setup:claude, then send a Claude message');
+function accountId(tool, account, index) { return `${tool}-${String(account || index + 1).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`; }
+function readClaude(cachePath = paths.claude, account = null, index = 0) {
+  const raw = readJson(cachePath);
+  const id = accountId('claude', account, index);
+  return raw ? quotaProvider(id, 'Claude', raw, raw.fetchedAt, account) : unavailable(id, 'Claude', 'quota', `Waiting for ${cachePath}`, account);
 }
 
-function codexDay(date) {
-  return path.join(paths.codex, String(date.getFullYear()), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0'));
+function codexDay(date, sessionsDir = paths.codex) {
+  return path.join(sessionsDir, String(date.getFullYear()), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0'));
 }
-function readCodex() {
+function readCodex(sessionsDir = paths.codex, account = null, index = 0) {
   let newest = null;
   for (let offset = 0; offset < 14; offset += 1) {
-    const dir = codexDay(new Date(Date.now() - offset * 86400000));
+    const dir = codexDay(new Date(Date.now() - offset * 86400000), sessionsDir);
     let files = []; try { files = fs.readdirSync(dir).filter((x) => x.endsWith('.jsonl')); } catch { continue; }
     for (const file of files) {
       let text = ''; try { text = fs.readFileSync(path.join(dir, file), 'utf8'); } catch { continue; }
@@ -69,7 +71,8 @@ function readCodex() {
       }
     }
   }
-  return newest ? quotaProvider('codex', 'Codex', newest.limits, newest.at) : unavailable('codex', 'Codex', 'quota', 'No recent Codex rate-limit snapshot');
+  const id = accountId('codex', account, index);
+  return newest ? quotaProvider(id, 'Codex', newest.limits, newest.at, account) : unavailable(id, 'Codex', 'quota', `No rate-limit snapshot in ${sessionsDir}`, account);
 }
 function readAgy() {
   const raw = readJson(paths.agy);
@@ -121,7 +124,11 @@ let cache = { at: 0, data: null };
 async function usage() {
   if (cache.data && Date.now() - cache.at < 8000) return cache.data;
   const config = readJson(paths.config) || {};
-  const providers = [readAgy(), readCodex(), readClaude(), await readOpenRouter(config), await readKilo(config)];
+  const claudeAccounts = Array.isArray(config?.accounts?.claude) && config.accounts.claude.length
+    ? config.accounts.claude.map((entry, index) => readClaude(entry.cache, entry.email, index)) : [readClaude()];
+  const codexAccounts = Array.isArray(config?.accounts?.codex) && config.accounts.codex.length
+    ? config.accounts.codex.map((entry, index) => readCodex(entry.sessionsDir, entry.email, index)) : [readCodex()];
+  const providers = [readAgy(), ...codexAccounts, ...claudeAccounts, await readOpenRouter(config), await readKilo(config)];
   cache = { at: Date.now(), data: { generatedAt: Date.now(), refreshMs: REFRESH_MS, providers } };
   return cache.data;
 }

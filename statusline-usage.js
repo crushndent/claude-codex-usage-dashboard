@@ -4,7 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const CACHE_PATH = process.env.CLAUDE_USAGE_CACHE
+const cacheArg = process.argv.indexOf('--cache');
+const CACHE_PATH = (cacheArg >= 0 && process.argv[cacheArg + 1])
+  || process.env.CLAUDE_USAGE_CACHE
   || path.join(os.homedir(), '.claude', 'usage-cache.json');
 
 let input = '';
