@@ -109,9 +109,20 @@ async function readClaudeLive(entry, index) {
     });
     const provider = quotaProvider(accountId('claude', entry.email, index), 'Claude', raw, Date.now(), entry.email);
     const extra = raw.extra_usage;
+    provider.extraUsage = {
+      enabled: Boolean(extra?.is_enabled),
+      currency: extra?.currency || 'USD',
+      disabledReason: extra?.disabled_reason || null,
+      monthlyLimit: null,
+      used: null,
+      remaining: null,
+    };
     if (extra?.is_enabled && Number.isFinite(Number(extra.monthly_limit)) && Number.isFinite(Number(extra.used_credits))) {
       const scale = 10 ** Number(extra.decimal_places || 0);
-      provider.overageRemaining = Math.max(0, (Number(extra.monthly_limit) - Number(extra.used_credits)) / scale);
+      provider.extraUsage.monthlyLimit = Number(extra.monthly_limit) / scale;
+      provider.extraUsage.used = Number(extra.used_credits) / scale;
+      provider.extraUsage.remaining = Math.max(0, provider.extraUsage.monthlyLimit - provider.extraUsage.used);
+      provider.overageRemaining = provider.extraUsage.remaining;
     }
     provider.source = 'live account API';
     return provider;
