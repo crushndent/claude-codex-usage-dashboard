@@ -1,12 +1,13 @@
 {
-  "name": "claude-codex-usage-dashboard",
-  "version": "0.4.1",
-  "description": "A local Windows and macOS dashboard for Claude Code and Codex usage limits.",
+  "name": "llm-fuel-dashboard",
+  "version": "1.0.0",
+  "description": "Local remaining-quota dashboard for agy, Codex, Claude, OpenCode, OpenRouter and Kilo Code.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "setup:claude": "node setup-statusline.js",
-    "setup:claude:fanout": "node setup-statusline.js --fanout"
+    "setup:claude:fanout": "node setup-statusline.js --fanout",
+    "test": "node test.js"
   },
   "keywords": [
     "claude",

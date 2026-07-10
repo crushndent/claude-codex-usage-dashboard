@@ -1,3 +1,7 @@
 {
-  "extraStatuslineCommand": ""
+  "extraStatuslineCommand": "",
+  "providers": {
+    "kilo": { "remaining": 12.50, "unit": "USD" },
+    "openrouter": { "remaining": 20.00, "unit": "USD" }
+  }
 }

@@ -4,775 +4,138 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
 
-const HOST = process.env.HOST || '0.0.0.0';
-
-function envNumber(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) ? value : fallback;
-}
-
-const PORT = envNumber('PORT', 8787);
-const ALERT_PERCENT = envNumber('ALERT_PERCENT', 85);
-const CODEX_LOOKBACK_DAYS = envNumber('CODEX_LOOKBACK_DAYS', 14);
-const KOBO_REFRESH_SECONDS = envNumber('KOBO_REFRESH_SECONDS', 60);
-const DISPLAY_MODE = ['used', 'remaining'].includes(String(process.env.DISPLAY_MODE || '').toLowerCase())
-  ? String(process.env.DISPLAY_MODE).toLowerCase()
-  : 'used';
-
-const CLAUDE_CACHE = process.env.CLAUDE_USAGE_CACHE
-  || path.join(os.homedir(), '.claude', 'usage-cache.json');
-const CODEX_SESSIONS = process.env.CODEX_SESSIONS_DIR
-  || path.join(os.homedir(), '.codex', 'sessions');
-
-function readJson(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (error) {
-    return null;
-  }
-}
-
-function normalizeClaudeWindow(windowData) {
-  if (!windowData || typeof windowData.used_percentage !== 'number') return null;
-  return {
-    used: windowData.used_percentage,
-    resetAt: windowData.resets_at ? windowData.resets_at * 1000 : null,
-  };
-}
-
-function normalizeCodexWindow(windowData) {
-  if (!windowData || typeof windowData.used_percent !== 'number') return null;
-  return {
-    used: windowData.used_percent,
-    resetAt: windowData.resets_at ? windowData.resets_at * 1000 : null,
-  };
-}
-
-function readClaudeUsage() {
-  const data = readJson(CLAUDE_CACHE);
-  if (!data || !data.rate_limits) {
-    return { fetchedAt: null, five: null, seven: null };
-  }
-
-  return {
-    fetchedAt: data.fetchedAt || null,
-    five: normalizeClaudeWindow(data.rate_limits.five_hour),
-    seven: normalizeClaudeWindow(data.rate_limits.seven_day),
-  };
-}
-
-function getCodexDayDirectory(date) {
-  return path.join(
-    CODEX_SESSIONS,
-    String(date.getFullYear()),
-    String(date.getMonth() + 1).padStart(2, '0'),
-    String(date.getDate()).padStart(2, '0'),
-  );
-}
-
-function readCodexUsage() {
-  if (!fs.existsSync(CODEX_SESSIONS)) {
-    return { fetchedAt: null, five: null, seven: null };
-  }
-
-  const now = new Date();
-  let newest = null;
-
-  for (let dayOffset = 0; dayOffset < CODEX_LOOKBACK_DAYS; dayOffset += 1) {
-    const day = new Date(now.getTime() - dayOffset * 86400000);
-    const dir = getCodexDayDirectory(day);
-    if (!fs.existsSync(dir)) continue;
-
-    let files = [];
-    try {
-      files = fs.readdirSync(dir)
-        .filter((fileName) => fileName.startsWith('rollout-') && fileName.endsWith('.jsonl'));
-    } catch (error) {
-      continue;
-    }
-
-    for (const fileName of files) {
-      const filePath = path.join(dir, fileName);
-      let lines = [];
-      try {
-        lines = fs.readFileSync(filePath, 'utf8').split('\n');
-      } catch (error) {
-        continue;
-      }
-
-      for (const line of lines) {
-        if (!line || !line.includes('token_count')) continue;
-
-        let event = null;
-        try {
-          event = JSON.parse(line);
-        } catch (error) {
-          continue;
-        }
-
-        const payload = event && event.payload;
-        if (!payload || payload.type !== 'token_count' || !payload.rate_limits) continue;
-
-        const timestamp = Date.parse(event.timestamp || 0);
-        if (!timestamp) continue;
-
-        if (!newest || timestamp > newest.timestamp) {
-          newest = { timestamp, rateLimits: payload.rate_limits };
-        }
-      }
-    }
-  }
-
-  if (!newest) {
-    return { fetchedAt: null, five: null, seven: null };
-  }
-
-  return {
-    fetchedAt: newest.timestamp,
-    five: normalizeCodexWindow(newest.rateLimits.primary),
-    seven: normalizeCodexWindow(newest.rateLimits.secondary),
-  };
-}
-
-let codexCache = { fetchedAt: 0, data: null };
-
-function getCodexUsage() {
-  const now = Date.now();
-  if (codexCache.data && now - codexCache.fetchedAt < 8000) {
-    return codexCache.data;
-  }
-
-  let data = null;
-  try {
-    data = readCodexUsage();
-  } catch (error) {
-    data = { fetchedAt: null, five: null, seven: null };
-  }
-
-  codexCache = { fetchedAt: now, data };
-  return data;
-}
-
-function getLanAddress() {
-  const networks = os.networkInterfaces();
-  for (const name of Object.keys(networks)) {
-    for (const network of networks[name] || []) {
-      if (network.family === 'IPv4' && !network.internal) {
-        return network.address;
-      }
-    }
-  }
-  return 'localhost';
-}
-
-function clampPercent(value) {
-  return Math.max(0, Math.min(100, value));
-}
-
-function getDisplayMode(requestUrl) {
-  try {
-    const url = new URL(requestUrl, 'http://localhost');
-    const mode = String(url.searchParams.get('mode') || '').toLowerCase();
-    if (mode === 'used' || mode === 'remaining') return mode;
-
-    const route = url.pathname.replace(/\/+$/, '').toLowerCase();
-    if (route === '/u' || route === '/ku') return 'used';
-    if (route === '/k' || route === '/e' || route === '/r' || route === '/kr') return 'remaining';
-  } catch (error) {}
-  return DISPLAY_MODE;
-}
-
-function isKoboPath(requestPath) {
-  return [
-    '/kobo', '/kobo/',
-    '/eink', '/eink/',
-    '/k', '/k/',
-    '/e', '/e/',
-    '/r', '/r/',
-    '/u', '/u/',
-    '/kr', '/kr/',
-    '/ku', '/ku/',
-  ].includes(requestPath);
-}
-
-function getDisplayedPercent(windowData, mode) {
-  if (!windowData || typeof windowData.used !== 'number') return null;
-  return mode === 'remaining'
-    ? clampPercent(100 - windowData.used)
-    : clampPercent(windowData.used);
-}
-
-function formatPercent(windowData, mode) {
-  const value = getDisplayedPercent(windowData, mode);
-  return value === null ? '--' : String(Math.round(value)) + '%';
-}
-
-function formatModeLabel(mode) {
-  return mode === 'remaining' ? 'remaining' : 'used';
-}
-
-function formatAge(timestamp) {
-  if (!timestamp) return 'no data';
-  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
-  if (seconds < 60) return 'updated now';
-  if (seconds < 3600) return 'updated ' + Math.floor(seconds / 60) + 'm ago';
-  if (seconds < 86400) return 'updated ' + Math.floor(seconds / 3600) + 'h ago';
-  return 'updated ' + Math.floor(seconds / 86400) + 'd ago';
-}
-
-function formatReset(timestamp) {
-  if (!timestamp) return '';
-  const seconds = Math.floor((timestamp - Date.now()) / 1000);
-  if (seconds <= 0) return 'reset';
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (days > 0) return 'reset ' + days + 'd ' + hours + 'h';
-  if (hours > 0) return 'reset ' + hours + 'h ' + minutes + 'm';
-  return 'reset ' + Math.max(0, minutes) + 'm';
-}
-
-function koboBar(windowData, mode) {
-  const value = getDisplayedPercent(windowData, mode);
-  const width = value === null ? 0 : Math.max(2, Math.round(value));
-  return '<div class="bar"><div class="fill" style="width:' + width + '%"></div></div>';
-}
-
-function koboMetric(label, windowData, mode) {
-  const alert = windowData && typeof windowData.used === 'number' && windowData.used >= ALERT_PERCENT;
-  return '<tr class="' + (alert ? 'alert' : '') + '">'
-    + '<th>' + label + '</th>'
-    + '<td class="num">' + formatPercent(windowData, mode) + '</td>'
-    + '<td class="reset">' + formatReset(windowData && windowData.resetAt) + '</td>'
-    + '<td class="mark">' + (alert ? '!' : '') + '</td>'
-    + '</tr><tr class="barrow"><td colspan="4">' + koboBar(windowData, mode) + '</td></tr>';
-}
-
-function koboCard(name, usage, mode) {
-  return '<section class="card">'
-    + '<div class="head">'
-    + '<h2>' + name + '</h2>'
-    + '<p>' + formatAge(usage.fetchedAt) + '</p>'
-    + '</div>'
-    + '<table>'
-    + '<tbody>'
-    + koboMetric('5 hours', usage.five, mode)
-    + koboMetric('weekly', usage.seven, mode)
-    + '</tbody>'
-    + '</table>'
-    + '</section>';
-}
-
-function koboPageHtml(requestUrl) {
-  const mode = getDisplayMode(requestUrl);
-  const claude = readClaudeUsage();
-  const codex = getCodexUsage();
-  const generatedAt = new Date().toLocaleString('en-US', { hour12: false });
-
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="${Math.max(15, Math.round(KOBO_REFRESH_SECONDS))}">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Usage - KOBO</title>
-<style>
-html, body {
-  margin: 0;
-  padding: 0;
-  background: #fff;
-  color: #000;
-  font-family: Georgia, "Times New Roman", serif;
-}
-body {
-  padding: 18px 16px;
-}
-.top {
-  border-bottom: 3px solid #000;
-  margin-bottom: 18px;
-  padding-bottom: 10px;
-}
-h1 {
-  font-size: 28px;
-  line-height: 1;
-  margin: 0 0 8px 0;
-  letter-spacing: 0;
-}
-.sub {
-  font-size: 14px;
-  line-height: 1.3;
-  margin: 0;
-}
-.card {
-  border: 2px solid #000;
-  margin: 0 0 18px 0;
-  padding: 12px 10px 8px 10px;
-  page-break-inside: avoid;
-}
-.head {
-  border-bottom: 1px solid #000;
-  margin-bottom: 8px;
-  padding-bottom: 6px;
-}
-h2 {
-  font-size: 28px;
-  line-height: 1;
-  margin: 0 0 5px 0;
-  text-transform: uppercase;
-}
-p {
-  margin: 0;
-}
-.head p {
-  font-size: 13px;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-th, td {
-  padding: 4px 0;
-  vertical-align: baseline;
-}
-th {
-  width: 36%;
-  font-size: 17px;
-  text-align: left;
-  text-transform: uppercase;
-}
-.num {
-  width: 30%;
-  font-size: 36px;
-  font-weight: bold;
-  text-align: right;
-}
-.reset {
-  width: 28%;
-  font-size: 13px;
-  text-align: right;
-}
-.mark {
-  width: 6%;
-  font-size: 30px;
-  font-weight: bold;
-  text-align: right;
-}
-.barrow td {
-  padding: 0 0 12px 0;
-}
-.bar {
-  width: 100%;
-  height: 14px;
-  border: 1px solid #000;
-  background: #fff;
-}
-.fill {
-  height: 14px;
-  background: #000;
-}
-.alert .num,
-.alert .mark {
-  color: #000;
-}
-.footer {
-  border-top: 1px solid #000;
-  padding-top: 8px;
-  font-size: 12px;
-  line-height: 1.25;
-}
-@media (min-width: 760px) {
-  body {
-    padding: 24px;
-  }
-  .wrap {
-    width: 720px;
-    margin: 0 auto;
-  }
-}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="top">
-    <h1>AI Usage</h1>
-    <p class="sub">KOBO / e-ink mode - showing ${formatModeLabel(mode)} - refresh ${Math.max(15, Math.round(KOBO_REFRESH_SECONDS))}s</p>
-  </div>
-  ${koboCard('Claude', claude, mode)}
-  ${koboCard('Codex', codex, mode)}
-  <div class="footer">
-    <p>Generated ${generatedAt}. Short URLs: <strong>/k</strong> for remaining, <strong>/u</strong> for used.</p>
-    <p>Long URLs also work: <strong>/kobo?mode=remaining</strong> and <strong>/kobo?mode=used</strong>.</p>
-    <p>Marked <strong>!</strong> means used percentage is at or above ${Math.round(ALERT_PERCENT)}%.</p>
-  </div>
-</div>
-</body>
-</html>`;
-}
-
-function pageHtml() {
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#EBE6D9">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@600;800&display=swap" rel="stylesheet">
-<title>Claude / Codex Usage Dashboard</title>
-<style>
-:root {
-  --bg: #EBE6D9;
-  --card: #FFFFFF;
-  --text: #2B2A26;
-  --muted: #6B6A62;
-  --faint: #A6A399;
-  --track: #EAE6DC;
-  --claude: #BE7457;
-  --codex: #767FC6;
-  --alert: #B23A2E;
-}
-* {
-  box-sizing: border-box;
-  margin: 0;
-  -webkit-tap-highlight-color: transparent;
-  user-select: none;
-}
-html,
-body {
-  width: 100%;
-  min-height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: "Segoe UI", system-ui, -apple-system, "Noto Sans TC", "PingFang TC", sans-serif;
-}
-body {
-  display: flex;
-  gap: clamp(16px, 4vw, 48px);
-  padding: 7vh calc(env(safe-area-inset-right) + 4.5vw) calc(env(safe-area-inset-bottom) + 2.4vh) calc(env(safe-area-inset-left) + 4.5vw);
-  overflow: hidden;
-}
-.card {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background: var(--card);
-  border-radius: 8px;
-  box-shadow: 0 4px 22px rgba(60, 52, 38, 0.10);
-  padding: clamp(22px, 4vmin, 48px) clamp(24px, 5.5vmin, 60px);
-}
-.head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 9vmin;
-}
-.brand {
-  font-family: Inter, "Segoe UI", system-ui, sans-serif;
-  font-size: clamp(30px, 5.6vmin, 68px);
-  font-weight: 800;
-  line-height: 1;
-  letter-spacing: 0;
-  white-space: nowrap;
-}
-.brand.claude { color: var(--claude); }
-.brand.codex { color: var(--codex); }
-.age {
-  color: var(--faint);
-  font-size: clamp(16px, 3.2vmin, 36px);
-  font-weight: 500;
-  white-space: nowrap;
-}
-.mode {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  align-self: flex-start;
-  min-height: 28px;
-  padding: 4px 10px;
-  margin-top: 14px;
-  border: 1px solid var(--track);
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: clamp(13px, 2.1vmin, 24px);
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
-}
-.metrics {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: clamp(24px, 4.8vh, 52px);
-}
-.label {
-  color: var(--muted);
-  font-size: clamp(22px, 5vmin, 54px);
-  font-weight: 600;
-  line-height: 1.1;
-  letter-spacing: 0;
-}
-.numrow {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 24px;
-  margin-top: 0.8vh;
-}
-.big {
-  font-family: Inter, "Segoe UI", system-ui, sans-serif;
-  font-size: clamp(62px, 14vmin, 150px);
-  font-weight: 800;
-  line-height: 0.9;
-  letter-spacing: 0;
-  white-space: nowrap;
-}
-.big .percent {
-  font-size: 0.42em;
-  font-weight: 600;
-  margin-left: 0.16em;
-}
-.reset {
-  color: var(--faint);
-  font-size: clamp(16px, 3.4vmin, 36px);
-  font-weight: 500;
-  line-height: 1.2;
-  padding-bottom: 1.5vh;
-  text-align: right;
-  white-space: nowrap;
-}
-.bar {
-  height: clamp(10px, 2vmin, 22px);
-  background: var(--track);
-  border-radius: 999px;
-  overflow: hidden;
-  margin-top: 1.6vh;
-}
-.bar > i {
-  display: block;
-  width: 0;
-  height: 100%;
-  border-radius: 999px;
-  transition: width 0.7s ease, background 0.7s ease;
-}
-@media (max-width: 720px) {
-  body {
-    flex-direction: column;
-    min-height: 100%;
-    overflow: auto;
-    padding-top: calc(env(safe-area-inset-top) + 24px);
-  }
-  .card {
-    min-height: 360px;
-  }
-}
-</style>
-</head>
-<body>
-  <section class="card" aria-label="Claude usage">
-    <div class="head">
-      <div class="brand claude">Claude</div>
-      <div class="age" id="age_claude">No data</div>
-    </div>
-    <div class="mode">${DISPLAY_MODE === 'remaining' ? 'Remaining' : 'Used'}</div>
-    <div class="metrics">
-      <div class="metric">
-        <div class="label">5 hours</div>
-        <div class="numrow">
-          <div class="big"><span id="num_claude_five">--</span><span class="percent" id="pct_claude_five"></span></div>
-          <div class="reset" id="reset_claude_five"></div>
-        </div>
-        <div class="bar"><i id="bar_claude_five"></i></div>
-      </div>
-      <div class="metric">
-        <div class="label">Weekly</div>
-        <div class="numrow">
-          <div class="big"><span id="num_claude_seven">--</span><span class="percent" id="pct_claude_seven"></span></div>
-          <div class="reset" id="reset_claude_seven"></div>
-        </div>
-        <div class="bar"><i id="bar_claude_seven"></i></div>
-      </div>
-    </div>
-  </section>
-  <section class="card" aria-label="Codex usage">
-    <div class="head">
-      <div class="brand codex">Codex</div>
-      <div class="age" id="age_codex">No data</div>
-    </div>
-    <div class="mode">${DISPLAY_MODE === 'remaining' ? 'Remaining' : 'Used'}</div>
-    <div class="metrics">
-      <div class="metric">
-        <div class="label">5 hours</div>
-        <div class="numrow">
-          <div class="big"><span id="num_codex_five">--</span><span class="percent" id="pct_codex_five"></span></div>
-          <div class="reset" id="reset_codex_five"></div>
-        </div>
-        <div class="bar"><i id="bar_codex_five"></i></div>
-      </div>
-      <div class="metric">
-        <div class="label">Weekly</div>
-        <div class="numrow">
-          <div class="big"><span id="num_codex_seven">--</span><span class="percent" id="pct_codex_seven"></span></div>
-          <div class="reset" id="reset_codex_seven"></div>
-        </div>
-        <div class="bar"><i id="bar_codex_seven"></i></div>
-      </div>
-    </div>
-  </section>
-<script>
-const COLORS = {
-  claude: '#BE7457',
-  codex: '#767FC6',
-  alert: '#B23A2E',
-  faint: '#A6A399',
+const ROOT = __dirname;
+const HOST = process.env.HOST || '127.0.0.1';
+const PORT = Number(process.env.PORT) || 8787;
+const REFRESH_MS = Math.max(15_000, Number(process.env.REFRESH_MS) || 60_000);
+const HOME = os.homedir();
+const paths = {
+  claude: process.env.CLAUDE_USAGE_CACHE || path.join(HOME, '.claude', 'usage-cache.json'),
+  codex: process.env.CODEX_SESSIONS_DIR || path.join(HOME, '.codex', 'sessions'),
+  agy: process.env.AGY_USAGE_CACHE || path.join(HOME, '.cache', 'agy', 'usage.json'),
+  config: process.env.LLM_DASHBOARD_CONFIG || path.join(ROOT, 'config.json'),
 };
-const ALERT_PERCENT = ${JSON.stringify(ALERT_PERCENT)};
-const DISPLAY_MODE = ${JSON.stringify(DISPLAY_MODE)};
-const $ = (id) => document.getElementById(id);
 
-function resetText(timestamp) {
-  if (!timestamp) return '';
-  const seconds = Math.floor((timestamp - Date.now()) / 1000);
-  if (seconds <= 0) return 'Reset';
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (days > 0) return 'Reset in ' + days + 'd ' + hours + 'h';
-  if (hours > 0) return 'Reset in ' + hours + 'h ' + minutes + 'm';
-  return 'Reset in ' + Math.max(0, minutes) + 'm';
+function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
+function clamp(n) { return Math.max(0, Math.min(100, Number(n))); }
+function epoch(value) {
+  if (!value) return null;
+  if (typeof value === 'number') return value < 1e12 ? value * 1000 : value;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function quotaWindow(value) {
+  if (!value) return null;
+  const used = value.used_percentage ?? value.used_percent ?? value.used;
+  const remaining = value.remaining_percentage ?? value.remaining_percent ?? value.remaining;
+  const usedPercent = Number.isFinite(Number(used)) ? clamp(used) :
+    Number.isFinite(Number(remaining)) ? clamp(100 - remaining) : null;
+  if (usedPercent === null) return null;
+  return { usedPercent, remainingPercent: 100 - usedPercent, resetAt: epoch(value.resets_at ?? value.reset_at ?? value.resetAt) };
+}
+function quotaProvider(id, name, raw, fetchedAt) {
+  const limits = raw?.rate_limits || raw?.rateLimits || raw?.quota || raw || {};
+  return {
+    id, name, kind: 'quota', fetchedAt: epoch(fetchedAt ?? raw?.fetchedAt ?? raw?.updated_at),
+    five: quotaWindow(limits.five_hour ?? limits.fiveHour ?? limits.primary ?? limits.session),
+    weekly: quotaWindow(limits.seven_day ?? limits.sevenDay ?? limits.weekly ?? limits.secondary),
+  };
+}
+function unavailable(id, name, kind, detail) { return { id, name, kind, status: 'unavailable', detail }; }
+
+function readClaude() {
+  const raw = readJson(paths.claude);
+  return raw ? quotaProvider('claude', 'Claude', raw, raw.fetchedAt) : unavailable('claude', 'Claude', 'quota', 'Run setup:claude, then send a Claude message');
 }
 
-function ageText(timestamp) {
-  if (!timestamp) return 'No data';
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
-  if (seconds < 60) return 'Updated now';
-  if (seconds < 3600) return 'Updated ' + Math.floor(seconds / 60) + 'm ago';
-  if (seconds < 86400) return 'Updated ' + Math.floor(seconds / 3600) + 'h ago';
-  return 'Updated ' + Math.floor(seconds / 86400) + 'd ago';
+function codexDay(date) {
+  return path.join(paths.codex, String(date.getFullYear()), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0'));
 }
-
-function setMetric(prefix, data, baseColor) {
-  const number = $('num_' + prefix);
-  const percent = $('pct_' + prefix);
-  const bar = $('bar_' + prefix);
-  const reset = $('reset_' + prefix);
-
-  if (!data || typeof data.used !== 'number') {
-    number.textContent = '--';
-    number.style.color = COLORS.faint;
-    percent.textContent = '';
-    bar.style.width = '0';
-    reset.textContent = '';
-    return;
+function readCodex() {
+  let newest = null;
+  for (let offset = 0; offset < 14; offset += 1) {
+    const dir = codexDay(new Date(Date.now() - offset * 86400000));
+    let files = []; try { files = fs.readdirSync(dir).filter((x) => x.endsWith('.jsonl')); } catch { continue; }
+    for (const file of files) {
+      let text = ''; try { text = fs.readFileSync(path.join(dir, file), 'utf8'); } catch { continue; }
+      for (const line of text.split('\n')) {
+        if (!line.includes('rate_limits')) continue;
+        let event; try { event = JSON.parse(line); } catch { continue; }
+        const limits = event?.payload?.rate_limits;
+        const at = epoch(event?.timestamp);
+        if (limits && at && (!newest || at > newest.at)) newest = { at, limits };
+      }
+    }
   }
-
-  const displayValue = DISPLAY_MODE === 'remaining'
-    ? Math.max(0, 100 - data.used)
-    : data.used;
-  const color = data.used >= ALERT_PERCENT ? COLORS.alert : baseColor;
-  number.textContent = String(Math.round(displayValue));
-  number.style.color = color;
-  percent.textContent = '%';
-  percent.style.color = color;
-  bar.style.width = Math.max(2, Math.min(100, displayValue)) + '%';
-  bar.style.background = color;
-  reset.textContent = resetText(data.resetAt);
+  return newest ? quotaProvider('codex', 'Codex', newest.limits, newest.at) : unavailable('codex', 'Codex', 'quota', 'No recent Codex rate-limit snapshot');
+}
+function readAgy() {
+  const raw = readJson(paths.agy);
+  return raw ? quotaProvider('agy', 'agy', raw, raw.fetchedAt) : unavailable('agy', 'agy', 'quota', `Waiting for ${paths.agy}`);
 }
 
-async function refreshUsage() {
-  try {
-    const response = await fetch('/api/usage', { cache: 'no-store' });
-    const usage = await response.json();
-    const claude = usage.claude || {};
-    const codex = usage.codex || {};
-
-    setMetric('claude_five', claude.five, COLORS.claude);
-    setMetric('claude_seven', claude.seven, COLORS.claude);
-    setMetric('codex_five', codex.five, COLORS.codex);
-    setMetric('codex_seven', codex.seven, COLORS.codex);
-    $('age_claude').textContent = ageText(claude.fetchedAt);
-    $('age_codex').textContent = ageText(codex.fetchedAt);
-  } catch (error) {
-    $('age_claude').textContent = 'Offline';
-    $('age_codex').textContent = 'Offline';
-  }
+function configuredBalance(id, name, config) {
+  const value = config?.providers?.[id];
+  if (value == null) return null;
+  const remaining = Number(typeof value === 'object' ? value.remaining : value);
+  if (!Number.isFinite(remaining)) return null;
+  return { id, name, kind: 'balance', remaining, unit: value.unit || (id === 'openrouter' || id === 'kilo' ? 'USD' : 'tokens'), fetchedAt: Date.now(), detail: 'configured balance' };
 }
-
-let wakeLock = null;
-async function requestWakeLock() {
-  try {
-    if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen');
-  } catch (error) {}
-}
-
-refreshUsage();
-setInterval(refreshUsage, 2000);
-requestWakeLock();
-
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    refreshUsage();
-    requestWakeLock();
-  }
-});
-
-document.body.addEventListener('click', () => {
-  refreshUsage();
-  requestWakeLock();
-  const page = document.documentElement;
-  if (page.requestFullscreen && !document.fullscreenElement) {
-    try {
-      page.requestFullscreen();
-    } catch (error) {}
-  }
-});
-</script>
-</body>
-</html>`;
-}
-
-const server = http.createServer((request, response) => {
-  const requestPath = request.url ? request.url.split('?')[0] : '/';
-
-  if (isKoboPath(requestPath)) {
-    response.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
+function fetchJson(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = require('https').get(url, { headers, timeout: 8000 }, (res) => {
+      let body = ''; res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch (error) { reject(error); } });
     });
-    response.end(koboPageHtml(request.url));
-    return;
-  }
-
-  if (request.url === '/api/usage') {
-    response.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-    });
-    response.end(JSON.stringify({
-      displayMode: DISPLAY_MODE,
-      claude: readClaudeUsage(),
-      codex: getCodexUsage(),
-    }));
-    return;
-  }
-
-  response.writeHead(200, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-store',
+    req.on('timeout', () => req.destroy(new Error('timeout'))); req.on('error', reject);
   });
-  response.end(pageHtml());
-});
+}
+async function readOpenRouter(config) {
+  const manual = configuredBalance('openrouter', 'OpenRouter', config);
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) return manual || unavailable('openrouter', 'OpenRouter', 'balance', 'Set OPENROUTER_API_KEY or config.json');
+  try {
+    const data = await fetchJson('https://openrouter.ai/api/v1/credits', { Authorization: `Bearer ${key}` });
+    const total = Number(data?.data?.total_credits); const used = Number(data?.data?.total_usage);
+    if (!Number.isFinite(total) || !Number.isFinite(used)) throw new Error('unexpected response');
+    return { id: 'openrouter', name: 'OpenRouter', kind: 'balance', remaining: Math.max(0, total - used), unit: 'USD', fetchedAt: Date.now() };
+  } catch (error) { return manual || unavailable('openrouter', 'OpenRouter', 'balance', `API: ${error.message}`); }
+}
+function execJson(command, args) {
+  return new Promise((resolve, reject) => execFile(command, args, { timeout: 10000, env: process.env }, (error, stdout) => {
+    if (error) return reject(error); try { resolve(JSON.parse(stdout)); } catch (parseError) { reject(parseError); }
+  }));
+}
+async function readKilo(config) {
+  const manual = configuredBalance('kilo', 'Kilo Code', config);
+  try {
+    const raw = await execJson(process.env.KILO_BIN || 'kilo', ['profile', '--json']);
+    const remaining = Number(raw.balance ?? raw.credits ?? raw.remaining ?? raw.data?.balance);
+    if (!Number.isFinite(remaining)) throw new Error('balance missing from profile');
+    return { id: 'kilo', name: 'Kilo Code', kind: 'balance', remaining, unit: raw.currency || 'USD', fetchedAt: Date.now() };
+  } catch (error) { return manual || unavailable('kilo', 'Kilo Code', 'balance', 'Kilo profile unavailable; add config.json fallback'); }
+}
+let cache = { at: 0, data: null };
+async function usage() {
+  if (cache.data && Date.now() - cache.at < 8000) return cache.data;
+  const config = readJson(paths.config) || {};
+  const providers = [readAgy(), readCodex(), readClaude(), await readOpenRouter(config), await readKilo(config)];
+  cache = { at: Date.now(), data: { generatedAt: Date.now(), refreshMs: REFRESH_MS, providers } };
+  return cache.data;
+}
 
-server.listen(PORT, HOST, () => {
-  const visibleHost = HOST === '0.0.0.0' ? getLanAddress() : HOST;
-  console.log('Claude / Codex usage dashboard');
-  console.log('Local:  http://localhost:' + PORT);
-  console.log('Device: http://' + visibleHost + ':' + PORT);
-  console.log('KOBO:   http://' + visibleHost + ':' + PORT + '/k');
+function html() { return fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8'); }
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/api/usage') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(await usage()));
+  }
+  if (req.url === '/' || req.url.startsWith('/?')) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(html());
+  }
+  res.writeHead(404); res.end('Not found');
 });
+if (require.main === module) server.listen(PORT, HOST, () => console.log(`LLM Fuel: http://${HOST}:${PORT}`));
+module.exports = { quotaWindow, quotaProvider, readCodex, usage, server };
