@@ -123,6 +123,9 @@ async function readClaudeLive(entry, index) {
       provider.extraUsage.used = Number(extra.used_credits) / scale;
       provider.extraUsage.remaining = Math.max(0, provider.extraUsage.monthlyLimit - provider.extraUsage.used);
       provider.overageRemaining = provider.extraUsage.remaining;
+    } else if (entry.overageRemaining !== null && entry.overageRemaining !== '' && Number.isFinite(Number(entry.overageRemaining))) {
+      provider.extraUsage.remaining = Number(entry.overageRemaining);
+      provider.overageRemaining = Number(entry.overageRemaining);
     }
     provider.source = 'live account API';
     return provider;
@@ -141,7 +144,12 @@ async function readCodexLive(entry, index) {
     const raw = await fetchJson('https://chatgpt.com/backend-api/wham/usage', headers);
     const label = entry.email || raw.email || null;
     const provider = quotaProvider(accountId('codex', label, index), 'Codex', raw.rate_limit, Date.now(), label);
-    if (raw.credits?.has_credits && Number.isFinite(Number(raw.credits.balance))) provider.overageRemaining = Number(raw.credits.balance);
+    provider.extraCredits = {
+      enabled: Boolean(raw.credits?.has_credits),
+      balance: Number.isFinite(Number(raw.credits?.balance)) ? Number(raw.credits.balance) : null,
+      limitReached: Boolean(raw.credits?.overage_limit_reached),
+    };
+    if (provider.extraCredits.balance !== null) provider.overageRemaining = provider.extraCredits.balance;
     provider.source = 'live account API';
     return provider;
   } catch { return fallback; }
@@ -183,7 +191,9 @@ async function usage() {
   const codexAccounts = await Promise.all(codexEntries.map(readCodexLive));
   const anthropicApi = configuredBalance('anthropicApi', 'Anthropic API', config)
     || unavailable('anthropicApi', 'Anthropic API', 'balance', 'Add the current API balance to config.json');
-  const providers = [readAgy(), ...codexAccounts, ...claudeAccounts, anthropicApi, await readOpenRouter(config), await readKilo(config)];
+  const kilo = await readKilo(config);
+  const openRouter = await readOpenRouter(config);
+  const providers = [...claudeAccounts, ...codexAccounts, kilo, openRouter, anthropicApi, readAgy()];
   cache = { at: Date.now(), data: { generatedAt: Date.now(), refreshMs: REFRESH_MS, providers } };
   return cache.data;
 }
