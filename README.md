@@ -42,6 +42,20 @@ Open <http://127.0.0.1:8787>. To expose it to your LAN, explicitly start with
 `HOST=0.0.0.0 npm start`; do not expose this unauthenticated service to the
 internet.
 
+### Start automatically on Linux
+
+Install and immediately start a systemd user service:
+
+```bash
+./install-autostart-linux.sh
+```
+
+The installer enables user lingering so the service starts during system boot,
+without waiting for an interactive login. Remove the service with
+`./uninstall-autostart-linux.sh`; uninstalling deliberately leaves lingering
+unchanged because other user services may depend on it. To use a different
+port, set it while installing, for example `PORT=8788 ./install-autostart-linux.sh`.
+
 ## Claude setup
 
 Claude provides both quota windows to its status-line input. Install the
@@ -112,6 +126,19 @@ Write that JSON to `~/.cache/agy/usage.json`, or set `AGY_USAGE_CACHE` to a
 collector-generated file. If agy exposes only its 5-hour window, the weekly
 field deliberately displays “not exposed” rather than estimating it.
 
+## One-shot five-hour pre-warm
+
+Claude and Codex cards include a **Pre-warm at next 5-hour window** switch. When
+enabled, the dashboard waits for the displayed five-hour reset, waits another
+two minutes, makes one minimal request, and turns the switch off. The schedule
+is stored in `.prewarm-state.json`, so it survives a dashboard restart.
+
+The first two Claude accounts default to the `claude` and `claude2` commands;
+set `prewarmCommand` explicitly in `config.json` when account ordering differs.
+Codex defaults to `codex`. Keep the dashboard server running at the scheduled
+time. `PREWARM_DELAY_MS` and `LLM_DASHBOARD_PREWARM_SCRIPT` can override the
+two-minute delay and helper-script path for testing or custom installations.
+
 ## Configuration
 
 | Environment variable | Default |
@@ -123,6 +150,9 @@ field deliberately displays “not exposed” rather than estimating it.
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` |
 | `AGY_USAGE_CACHE` | `~/.cache/agy/usage.json` |
 | `LLM_DASHBOARD_CONFIG` | `./config.json` |
+| `LLM_DASHBOARD_PREWARM_STATE` | `./.prewarm-state.json` |
+| `LLM_DASHBOARD_PREWARM_SCRIPT` | `../../20areas/crons/pre-warm-llms-morning.sh` |
+| `PREWARM_DELAY_MS` | `120000` |
 | `KILO_BIN` | `kilo` |
 
 ## Verification

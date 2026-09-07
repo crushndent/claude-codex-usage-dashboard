@@ -1,9 +1,16 @@
 'use strict';
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const { quotaWindow, quotaProvider } = require('./server');
 assert.deepStrictEqual(quotaWindow({ used_percentage: 37, resets_at: 100 }), { usedPercent: 37, remainingPercent: 63, resetAt: 100000 });
 assert.strictEqual(quotaWindow({ remaining_percent: 81 }).usedPercent, 19);
 const p = quotaProvider('agy', 'agy', { rate_limits: { five_hour: { used_percent: 25 }, weekly: { used: 70 } } }, 1000);
 assert.strictEqual(p.five.remainingPercent, 75);
 assert.strictEqual(p.weekly.remainingPercent, 30);
+const dashboard = fs.readFileSync(path.join(__dirname, 'dashboard.html'), 'utf8');
+assert.match(dashboard, /Pre-warm at next 5-hour window/);
+assert.match(dashboard, /fetch\('\/api\/prewarm'/);
+const prewarmScript = fs.readFileSync(path.resolve(__dirname, '../../20areas/crons/pre-warm-llms-morning.sh'), 'utf8');
+for (const command of ['claude', 'claude2', 'codex']) assert.match(prewarmScript, new RegExp(`\\b${command}\\b`));
 console.log('tests passed');

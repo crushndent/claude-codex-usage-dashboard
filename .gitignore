@@ -5,6 +5,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 config.json
+.prewarm-state.json
 *.bak
 *.bak-*
 *.log

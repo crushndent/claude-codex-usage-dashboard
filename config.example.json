@@ -2,8 +2,8 @@
   "extraStatuslineCommand": "",
   "accounts": {
     "claude": [
-      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json", "overageRemaining": 10.00 },
-      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json", "overageRemaining": 25.00 }
+      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json", "overageRemaining": 10.00, "prewarmCommand": "claude" },
+      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json", "overageRemaining": 25.00, "prewarmCommand": "claude2" }
     ],
     "codex": [
       { "email": "personal@example.com", "sessionsDir": "/home/you/.codex-personal/sessions" },
