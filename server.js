@@ -16,12 +16,7 @@ const paths = {
   codex: process.env.CODEX_SESSIONS_DIR || path.join(HOME, '.codex', 'sessions'),
   agy: process.env.AGY_USAGE_CACHE || path.join(HOME, '.cache', 'agy', 'usage.json'),
   config: process.env.LLM_DASHBOARD_CONFIG || path.join(ROOT, 'config.json'),
-  prewarmState: process.env.LLM_DASHBOARD_PREWARM_STATE || path.join(ROOT, '.prewarm-state.json'),
-  prewarmScript: process.env.LLM_DASHBOARD_PREWARM_SCRIPT || path.resolve(ROOT, '../../20areas/crons/pre-warm-llms-morning.sh'),
 };
-const configuredPrewarmDelay = Number(process.env.PREWARM_DELAY_MS);
-const PREWARM_DELAY_MS = process.env.PREWARM_DELAY_MS !== undefined && Number.isFinite(configuredPrewarmDelay)
-  ? Math.max(0, configuredPrewarmDelay) : 120_000;
 
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
 function clamp(n) { return Math.max(0, Math.min(100, Number(n))); }
@@ -38,7 +33,9 @@ function quotaWindow(value) {
   const usedPercent = Number.isFinite(Number(used)) ? clamp(used) :
     Number.isFinite(Number(remaining)) ? clamp(100 - remaining) : null;
   if (usedPercent === null) return null;
-  return { usedPercent, remainingPercent: 100 - usedPercent, resetAt: epoch(value.resets_at ?? value.reset_at ?? value.resetAt) };
+  const windowSeconds = Number(value.limit_window_seconds ?? value.window_seconds ?? (value.window_minutes ?? value.windowMinutes) * 60);
+  return { usedPercent, remainingPercent: 100 - usedPercent, resetAt: epoch(value.resets_at ?? value.reset_at ?? value.resetAt),
+    windowMs: Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds * 1000 : null };
 }
 function quotaProvider(id, name, raw, fetchedAt, account = null) {
   const limits = raw?.rate_limits || raw?.rateLimits || raw?.quota || raw || {};
@@ -82,15 +79,15 @@ function readCodex(sessionsDir = paths.codex, account = null, index = 0) {
   const id = accountId('codex', account, index);
   return newest ? quotaProvider(id, 'Codex', newest.limits, newest.at, account) : unavailable(id, 'Codex', 'quota', `No rate-limit snapshot in ${sessionsDir}`, account);
 }
-function readAgyCache() {
-  const raw = readJson(paths.agy);
-  if (raw?.kind === 'pools' && Array.isArray(raw.pools)) return raw;
-  return raw ? quotaProvider('agy', 'agy', raw, raw.fetchedAt) : unavailable('agy', 'agy', 'quota', `Waiting for ${paths.agy}`);
+function readAgyCache(cachePath = paths.agy, id = 'agy', account = null) {
+  const raw = readJson(cachePath);
+  if (raw?.kind === 'pools' && Array.isArray(raw.pools)) return { ...raw, id };
+  return raw ? quotaProvider(id, 'agy', raw, raw.fetchedAt, account) : unavailable(id, 'agy', 'quota', `No snapshot yet. Open Antigravity signed in as ${account || 'this account'} to capture one.`, account);
 }
-function saveAgyCache(provider) {
+function saveAgyCache(provider, cachePath = paths.agy) {
   try {
-    fs.mkdirSync(path.dirname(paths.agy), { recursive: true });
-    fs.writeFileSync(paths.agy, JSON.stringify(provider));
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, JSON.stringify(provider));
   } catch {}
 }
 
@@ -140,35 +137,48 @@ function parseAgyStatus(data) {
     aiCredits: (status.userTier?.availableCredits || []).map((credit) => ({ type: credit.creditType, amount: Number(credit.creditAmount) }))
       .filter((credit) => Number.isFinite(credit.amount)) };
 }
-async function readAgy() {
-  const fallback = readAgyCache();
-  try {
-    let processList = '';
-    try { processList = String(await execText('pgrep', ['-x', 'agy'])); } catch {}
-    const pids = processList.trim().split(/\s+/).filter(Boolean);
-    if (!pids.length) throw new Error('agy is not running');
-    const sockets = String(await execText('ss', ['-tlnp']));
-    const ports = [];
-    for (const line of sockets.split('\n')) {
-      if (!pids.some((pid) => line.includes(`pid=${pid}`))) continue;
-      const match = line.trim().split(/\s+/)[3]?.match(/:(\d+)$/);
-      if (match && !ports.includes(Number(match[1]))) ports.push(Number(match[1]));
+// Every running agy process (one per account/HOME) answers GetUserStatus with its own email.
+async function liveAgyStatuses() {
+  let processList = '';
+  try { processList = String(await execText('pgrep', ['-x', 'agy'])); } catch {}
+  const pids = processList.trim().split(/\s+/).filter(Boolean);
+  if (!pids.length) throw new Error('agy is not running');
+  const sockets = String(await execText('ss', ['-tlnp']));
+  const ports = [];
+  for (const line of sockets.split('\n')) {
+    if (!pids.some((pid) => line.includes(`pid=${pid}`))) continue;
+    const match = line.trim().split(/\s+/)[3]?.match(/:(\d+)$/);
+    if (match && !ports.includes(Number(match[1]))) ports.push(Number(match[1]));
+  }
+  const route = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+  const body = { metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' } };
+  const found = [];
+  for (const port of ports) for (const secure of [true, false]) {
+    try { found.push(parseAgyStatus(await postLocalJson(port, secure, route, body))); break; } catch {}
+  }
+  if (!found.length) throw new Error('no responsive agy quota port');
+  return found;
+}
+async function readAgyAccounts(config) {
+  const configured = Array.isArray(config?.accounts?.agy) && config.accounts.agy.length;
+  const entries = configured ? config.accounts.agy : [{ cache: paths.agy }];
+  let live = [], liveError = null;
+  try { live = await liveAgyStatuses(); } catch (error) { liveError = error.message; }
+  return entries.map((entry, index) => {
+    const id = configured ? accountId('agy', entry.email, index) : 'agy';
+    const cachePath = entry.cache || paths.agy;
+    const email = entry.email ? entry.email.toLowerCase() : null;
+    const match = email ? live.find((p) => (p.account || '').toLowerCase() === email) : live[0];
+    if (match) {
+      const provider = { ...match, id, account: match.account || entry.email || null };
+      saveAgyCache(provider, cachePath);
+      return provider;
     }
-    const route = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
-    const body = { metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' } };
-    for (const port of ports) for (const secure of [true, false]) {
-      try {
-        const provider = parseAgyStatus(await postLocalJson(port, secure, route, body));
-        saveAgyCache(provider);
-        return provider;
-      } catch {}
-    }
-    throw new Error('no responsive agy quota port');
-  } catch (error) {
-    fallback.warning = error.message;
+    const fallback = readAgyCache(cachePath, id, entry.email || null);
+    fallback.warning = liveError || `no running agy logged in as ${entry.email}`;
     if (fallback.status !== 'unavailable') fallback.source = 'last live agy snapshot';
     return fallback;
-  }
+  });
 }
 
 function configuredBalance(id, name, config) {
@@ -189,7 +199,6 @@ function fetchJson(url, headers = {}) {
 }
 async function readClaudeLive(entry, index) {
   const fallback = readClaude(entry.cache, entry.email, index, entry.overageRemaining);
-  fallback.prewarmTarget = entry.prewarmCommand || (index === 0 ? 'claude' : index === 1 ? 'claude2' : null);
   const credentials = entry.credentials || path.join(path.dirname(entry.cache), '.credentials.json');
   const token = readJson(credentials)?.claudeAiOauth?.accessToken;
   if (!token) return fallback;
@@ -217,8 +226,14 @@ async function readClaudeLive(entry, index) {
       provider.extraUsage.remaining = Number(entry.overageRemaining);
       provider.overageRemaining = Number(entry.overageRemaining);
     }
+    // Dollar-denominated pools (e.g. promotional credit grants) appear under opaque keys with limit_dollars set.
+    provider.creditPools = Object.entries(raw).filter(([, value]) => value?.limit_dollars != null && Number(value.limit_dollars) > 0)
+      .map(([key, value]) => ({ key, limit: Number(value.limit_dollars), used: Number(value.used_dollars) || 0,
+        remaining: Number(value.remaining_dollars ?? value.limit_dollars - value.used_dollars), resetAt: epoch(value.resets_at), locked: value.locked_reason || null }));
+    const balance = raw.spend?.balance;
+    const minor = Number(balance?.amount_minor ?? balance);
+    provider.creditBalance = balance == null ? null : Number.isFinite(minor) ? minor / 10 ** Number(balance?.exponent ?? 2) : null;
     provider.source = 'live account API';
-    provider.prewarmTarget = entry.prewarmCommand || (index === 0 ? 'claude' : index === 1 ? 'claude2' : null);
     return provider;
   } catch (error) {
     fallback.source = 'local cache fallback';
@@ -229,7 +244,6 @@ async function readClaudeLive(entry, index) {
 async function readCodexLive(entry, index) {
   const sessionsDir = entry.sessionsDir || paths.codex;
   const fallback = readCodex(sessionsDir, entry.email, index);
-  fallback.prewarmTarget = entry.prewarmCommand || 'codex';
   const auth = readJson(entry.authFile || path.join(path.dirname(sessionsDir), 'auth.json'));
   const token = auth?.tokens?.access_token;
   const accountIdHeader = auth?.tokens?.account_id;
@@ -247,7 +261,6 @@ async function readCodexLive(entry, index) {
     };
     if (provider.extraCredits.balance !== null) provider.overageRemaining = provider.extraCredits.balance;
     provider.source = 'live account API';
-    provider.prewarmTarget = entry.prewarmCommand || 'codex';
     return provider;
   } catch (error) {
     fallback.source = 'local session fallback';
@@ -281,40 +294,8 @@ async function readKilo(config) {
   } catch (error) { return manual || unavailable('kilo', 'Kilo Code', 'balance', 'Kilo profile unavailable; add config.json fallback'); }
 }
 let cache = { at: 0, data: null };
-let prewarmJobs = readJson(paths.prewarmState)?.jobs || {};
-const prewarmTimers = new Map();
-
-function savePrewarmJobs() {
-  try { fs.writeFileSync(paths.prewarmState, JSON.stringify({ jobs: prewarmJobs }, null, 2)); } catch (error) { console.error(`Could not save pre-warm state: ${error.message}`); }
-}
-function firePrewarm(providerId) {
-  const job = prewarmJobs[providerId];
-  if (!job) return;
-  delete prewarmJobs[providerId];
-  prewarmTimers.delete(providerId);
-  savePrewarmJobs();
-  execFile(paths.prewarmScript, [job.target], { timeout: 120_000, env: process.env }, (error) => {
-    if (error) console.error(`Pre-warm failed for ${job.target}: ${error.message}`);
-    else console.log(`Pre-warmed ${job.target} after its five-hour window reset`);
-  });
-}
-function schedulePrewarm(job) {
-  const old = prewarmTimers.get(job.providerId);
-  if (old) clearTimeout(old);
-  const delay = Math.max(0, job.runAt - Date.now());
-  const timer = setTimeout(() => firePrewarm(job.providerId), Math.min(delay, 2_147_483_647));
-  prewarmTimers.set(job.providerId, timer);
-}
-function restorePrewarmJobs() {
-  for (const job of Object.values(prewarmJobs)) schedulePrewarm(job);
-}
-function prewarmView(provider) {
-  const job = prewarmJobs[provider.id];
-  if (!provider.prewarmTarget || provider.kind !== 'quota' || (!job && !provider.five?.resetAt)) return null;
-  return { enabled: Boolean(job), resetAt: job?.resetAt || null, runAt: job?.runAt || null };
-}
 async function usage() {
-  if (cache.data && Date.now() - cache.at < 8000) return { ...cache.data, providers: cache.data.providers.map((p) => ({ ...p, prewarm: prewarmView(p), prewarmTarget: undefined })) };
+  if (cache.data && Date.now() - cache.at < 8000) return cache.data;
   const config = readJson(paths.config) || {};
   const claudeEntries = Array.isArray(config?.accounts?.claude) && config.accounts.claude.length
     ? config.accounts.claude : [{ cache: paths.claude }];
@@ -326,50 +307,21 @@ async function usage() {
     || unavailable('anthropicApi', 'Anthropic API', 'balance', 'Add the current API balance to config.json');
   const kilo = await readKilo(config);
   const openRouter = await readOpenRouter(config);
-  const providers = [...claudeAccounts, ...codexAccounts, kilo, openRouter, anthropicApi, await readAgy()];
+  const providers = [...claudeAccounts, ...codexAccounts, kilo, openRouter, anthropicApi, ...await readAgyAccounts(config)];
   cache = { at: Date.now(), data: { generatedAt: Date.now(), refreshMs: REFRESH_MS, providers } };
-  return { ...cache.data, providers: providers.map((p) => ({ ...p, prewarm: prewarmView(p), prewarmTarget: undefined })) };
+  return cache.data;
 }
 
 function html() { return fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8'); }
-function readRequestJson(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk; if (body.length > 4096) req.destroy(); });
-    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch (error) { reject(error); } });
-    req.on('error', reject);
-  });
-}
 const server = http.createServer(async (req, res) => {
   if (req.url === '/api/usage') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify(await usage()));
-  }
-  if (req.url === '/api/prewarm' && req.method === 'POST') {
-    try {
-      const body = await readRequestJson(req);
-      await usage();
-      const provider = cache.data?.providers.find((item) => item.id === body.providerId);
-      if (!provider?.prewarmTarget || !['claude', 'claude2', 'codex'].includes(provider.prewarmTarget)) throw new Error('Provider cannot be pre-warmed');
-      if (body.enabled) {
-        if (!provider.five?.resetAt || provider.five.resetAt <= Date.now()) throw new Error('No future five-hour reset is available');
-        const job = { providerId: provider.id, target: provider.prewarmTarget, resetAt: provider.five.resetAt, runAt: provider.five.resetAt + PREWARM_DELAY_MS };
-        prewarmJobs[provider.id] = job; savePrewarmJobs(); schedulePrewarm(job);
-      } else {
-        delete prewarmJobs[provider.id]; savePrewarmJobs();
-        const timer = prewarmTimers.get(provider.id); if (timer) clearTimeout(timer); prewarmTimers.delete(provider.id);
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ ok: true, prewarm: prewarmView(provider) }));
-    } catch (error) {
-      res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: error.message }));
-    }
   }
   if (req.url === '/' || req.url.startsWith('/?')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(html());
   }
   res.writeHead(404); res.end('Not found');
 });
-restorePrewarmJobs();
 if (require.main === module) server.listen(PORT, HOST, () => console.log(`LLM Fuel: http://${HOST}:${PORT}`));
-module.exports = { quotaWindow, quotaProvider, readCodex, usage, server, prewarmView };
+module.exports = { quotaWindow, quotaProvider, readCodex, usage, server };

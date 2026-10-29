@@ -56,6 +56,24 @@ without waiting for an interactive login. Remove the service with
 unchanged because other user services may depend on it. To use a different
 port, set it while installing, for example `PORT=8788 ./install-autostart-linux.sh`.
 
+### Multiple agy accounts
+
+agy has no config-dir override (it always uses `~/.gemini`), so a second
+account runs with its own `HOME` via the `~/.local/bin/agy2` wrapper
+(`HOME=~/.agy2`). Log in once with `agy2`, then list both accounts under
+`accounts.agy` in `config.json`:
+
+```json
+"agy": [
+  {"email": "personal@example.com", "cache": "/home/you/.cache/agy/usage.json"},
+  {"email": "work@example.com", "cache": "/home/you/.cache/agy/usage-work.json"}
+]
+```
+
+The server queries every running `agy` process and matches each card by the
+email agy reports. A card whose account is not running shows its last cached
+snapshot.
+
 ## Claude setup
 
 Claude provides both quota windows to its status-line input. Install the
@@ -126,19 +144,6 @@ Write that JSON to `~/.cache/agy/usage.json`, or set `AGY_USAGE_CACHE` to a
 collector-generated file. If agy exposes only its 5-hour window, the weekly
 field deliberately displays “not exposed” rather than estimating it.
 
-## One-shot five-hour pre-warm
-
-Claude and Codex cards include a **Pre-warm at next 5-hour window** switch. When
-enabled, the dashboard waits for the displayed five-hour reset, waits another
-two minutes, makes one minimal request, and turns the switch off. The schedule
-is stored in `.prewarm-state.json`, so it survives a dashboard restart.
-
-The first two Claude accounts default to the `claude` and `claude2` commands;
-set `prewarmCommand` explicitly in `config.json` when account ordering differs.
-Codex defaults to `codex`. Keep the dashboard server running at the scheduled
-time. `PREWARM_DELAY_MS` and `LLM_DASHBOARD_PREWARM_SCRIPT` can override the
-two-minute delay and helper-script path for testing or custom installations.
-
 ## Configuration
 
 | Environment variable | Default |
@@ -150,9 +155,6 @@ two-minute delay and helper-script path for testing or custom installations.
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` |
 | `AGY_USAGE_CACHE` | `~/.cache/agy/usage.json` |
 | `LLM_DASHBOARD_CONFIG` | `./config.json` |
-| `LLM_DASHBOARD_PREWARM_STATE` | `./.prewarm-state.json` |
-| `LLM_DASHBOARD_PREWARM_SCRIPT` | `../../20areas/crons/pre-warm-llms-morning.sh` |
-| `PREWARM_DELAY_MS` | `120000` |
 | `KILO_BIN` | `kilo` |
 
 ## Verification

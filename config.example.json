@@ -2,17 +2,21 @@
   "extraStatuslineCommand": "",
   "accounts": {
     "claude": [
-      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json", "overageRemaining": 10.00, "prewarmCommand": "claude" },
-      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json", "overageRemaining": 25.00, "prewarmCommand": "claude2" }
+      { "email": "personal@example.com", "cache": "/home/you/.claude-personal/usage-cache.json", "overageRemaining": 10.0 },
+      { "email": "work@example.com", "cache": "/home/you/.claude-work/usage-cache.json", "overageRemaining": 25.0 }
     ],
     "codex": [
       { "email": "personal@example.com", "sessionsDir": "/home/you/.codex-personal/sessions" },
       { "email": "work@example.com", "sessionsDir": "/home/you/.codex-work/sessions" }
+    ],
+    "agy": [
+      { "email": "personal@example.com", "cache": "/home/you/.cache/agy/usage.json" },
+      { "email": "work@example.com", "cache": "/home/you/.cache/agy/usage-work.json" }
     ]
   },
   "providers": {
-    "anthropicApi": { "remaining": 50.00, "unit": "USD" },
-    "kilo": { "remaining": 12.50, "unit": "USD" },
-    "openrouter": { "remaining": 20.00, "unit": "USD" }
+    "anthropicApi": { "remaining": 50.0, "unit": "USD" },
+    "kilo": { "remaining": 12.5, "unit": "USD" },
+    "openrouter": { "remaining": 20.0, "unit": "USD" }
   }
 }
