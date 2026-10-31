@@ -16,6 +16,7 @@ const paths = {
   codex: process.env.CODEX_SESSIONS_DIR || path.join(HOME, '.codex', 'sessions'),
   agy: process.env.AGY_USAGE_CACHE || path.join(HOME, '.cache', 'agy', 'usage.json'),
   config: process.env.LLM_DASHBOARD_CONFIG || path.join(ROOT, 'config.json'),
+  history: process.env.LLM_FUEL_HISTORY_DIR || path.join(HOME, '.local', 'share', 'llm-fuel'),
 };
 
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
@@ -284,13 +285,57 @@ function execJson(command, args) {
     if (error) return reject(error); try { resolve(JSON.parse(stdout)); } catch (parseError) { reject(parseError); }
   }));
 }
+// Balance history: append-only JSONL per provider ({t, v}), sampled at most every SAMPLE_MS unless the balance changes.
+const DAY = 86400000;
+const SAMPLE_MS = 15 * 60000;
+const HISTORY_KEEP_MS = 90 * DAY;
+function historyFile(id) { return path.join(paths.history, `${id}-balance.jsonl`); }
+function readHistory(id) {
+  let text = ''; try { text = fs.readFileSync(historyFile(id), 'utf8'); } catch { return []; }
+  return text.split('\n').map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter((x) => x && Number.isFinite(x.t) && Number.isFinite(x.v)).sort((a, b) => a.t - b.t);
+}
+function recordBalance(id, value, at = Date.now()) {
+  if (!Number.isFinite(value)) return;
+  const history = readHistory(id);
+  const last = history[history.length - 1];
+  if (last && Math.abs(last.v - value) < 1e-6 && at - last.t < SAMPLE_MS) return;
+  try {
+    fs.mkdirSync(paths.history, { recursive: true });
+    const keep = history.filter((x) => x.t >= at - HISTORY_KEEP_MS);
+    if (keep.length < history.length) fs.writeFileSync(historyFile(id), keep.map((x) => JSON.stringify(x)).join('\n') + '\n');
+    fs.appendFileSync(historyFile(id), JSON.stringify({ t: at, v: value }) + '\n');
+  } catch {}
+}
+// Spend = sum of balance drops, so a top-up inside the window does not hide usage.
+function balanceTrend(history, now = Date.now(), windowMs = 7 * DAY) {
+  const start = now - windowMs;
+  const before = history.filter((x) => x.t < start).pop();
+  const inside = history.filter((x) => x.t >= start);
+  const points = before ? [before, ...inside] : inside;
+  if (points.length < 2) return { windowMs, since: points[0]?.t ?? null, points: points.map((x) => [x.t, x.v]), spent: null };
+  let spent = 0, added = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    const delta = points[i].v - points[i - 1].v;
+    if (delta < 0) spent -= delta; else added += delta;
+  }
+  const startValue = points[0].v;
+  const since = Math.max(points[0].t, before ? start : points[0].t);
+  const coveredMs = now - since;
+  const perDay = coveredMs >= 3600000 ? spent / (coveredMs / DAY) : null; // too noisy to extrapolate under an hour
+  const latest = points[points.length - 1].v;
+  return { windowMs, since, coveredMs, startValue, latest, spent, added,
+    spentPercent: startValue > 0 ? spent / startValue * 100 : null, perDay,
+    daysLeft: perDay > 0 ? latest / perDay : null, points: points.map((x) => [x.t, x.v]) };
+}
 async function readKilo(config) {
   const manual = configuredBalance('kilo', 'Kilo Code', config);
   try {
     const raw = await execJson(process.env.KILO_BIN || 'kilo', ['profile', '--json']);
     const remaining = Number(raw.balance ?? raw.credits ?? raw.remaining ?? raw.data?.balance);
     if (!Number.isFinite(remaining)) throw new Error('balance missing from profile');
-    return { id: 'kilo', name: 'Kilo Code', kind: 'balance', remaining, unit: raw.currency || 'USD', fetchedAt: Date.now() };
+    recordBalance('kilo', remaining);
+    return { id: 'kilo', name: 'Kilo Code', kind: 'balance', remaining, unit: raw.currency || 'USD', fetchedAt: Date.now(), trend: balanceTrend(readHistory('kilo')) };
   } catch (error) { return manual || unavailable('kilo', 'Kilo Code', 'balance', 'Kilo profile unavailable; add config.json fallback'); }
 }
 let cache = { at: 0, data: null };
@@ -323,5 +368,10 @@ const server = http.createServer(async (req, res) => {
   }
   res.writeHead(404); res.end('Not found');
 });
-if (require.main === module) server.listen(PORT, HOST, () => console.log(`LLM Fuel: http://${HOST}:${PORT}`));
-module.exports = { quotaWindow, quotaProvider, readCodex, usage, server };
+if (require.main === module) {
+  server.listen(PORT, HOST, () => console.log(`LLM Fuel: http://${HOST}:${PORT}`));
+  // Keep sampling balances even when no dashboard tab is open.
+  const sample = () => readKilo({}).catch(() => {});
+  sample(); setInterval(sample, SAMPLE_MS).unref();
+}
+module.exports = { quotaWindow, quotaProvider, readCodex, usage, server, balanceTrend };

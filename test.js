@@ -12,3 +12,10 @@ const dashboard = fs.readFileSync(path.join(__dirname, 'dashboard.html'), 'utf8'
 assert.doesNotMatch(dashboard, /prewarm/i);
 assert.match(dashboard, /time left/);
 console.log('tests passed');
+const { balanceTrend } = require('./server');
+const D = 86400000, now = 10 * D;
+const t = balanceTrend([{ t: 2 * D, v: 100 }, { t: 4 * D, v: 90 }, { t: 6 * D, v: 120 }, { t: 9 * D, v: 105 }], now);
+assert.strictEqual(t.startValue, 100); assert.strictEqual(t.spent, 25); assert.strictEqual(t.added, 30);
+assert.strictEqual(t.spentPercent, 25); assert.strictEqual(t.since, 3 * D);
+assert.strictEqual(balanceTrend([{ t: now, v: 5 }], now).spent, null);
+console.log('trend tests passed');
