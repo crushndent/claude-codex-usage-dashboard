@@ -367,7 +367,10 @@ async function cached(key, ms, fn) {
 const api = {
   '/api/usage': usage,
   '/api/activity': () => cached('activity', 8000, async () => ({ generatedAt: Date.now(), headroom: await monitors.headroom(), tools: monitors.tools() })),
-  '/api/local': () => cached('local', 5000, async () => ({ generatedAt: Date.now(), ...await monitors.localLlm(), series: monitors.series() })),
+  '/api/local': (q) => {
+    const range = { '24h': DAY, '7d': 7 * DAY, '30d': 30 * DAY }[q.get('range')] ? q.get('range') : '24h';
+    return cached('local:' + range, 5000, async () => ({ generatedAt: Date.now(), ...await monitors.localLlm(), range, series: monitors.series({ '24h': DAY, '7d': 7 * DAY, '30d': 30 * DAY }[range]) }));
+  },
   '/api/hindsight': () => cached('hindsight', 8000, async () => ({ generatedAt: Date.now(), ...await monitors.hindsight() })),
 };
 // Read-only proxy so each headroom dashboard can sit in a tab (works over the tailnet too, where 127.0.0.1 would not).
@@ -388,7 +391,7 @@ function proxyHeadroom(req, res, port, rest) {
 const server = http.createServer(async (req, res) => {
   const route = req.url.split('?')[0];
   if (api[route]) {
-    let data; try { data = await api[route](); } catch (e) { data = { error: e.message }; }
+    let data; try { data = await api[route](new URL(req.url, 'http://x').searchParams); } catch (e) { data = { error: e.message }; }
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify(data));
   }

@@ -24,3 +24,16 @@ const { parseProm } = require('./monitors');
 const rows = parseProm('# HELP x\nhindsight_llm_calls_total{scope="recall",success="true"} 3.0\nup 1\n');
 assert.strictEqual(rows[0].labels.scope, 'recall'); assert.strictEqual(rows[0].value, 3); assert.strictEqual(rows[1].name, 'up');
 console.log('monitor tests passed');
+{
+  const fs2 = require('fs'), os2 = require('os'), path2 = require('path');
+  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'llmfuel-'));
+  process.env.LLM_FUEL_HISTORY_DIR = dir;
+  delete require.cache[require.resolve('./monitors')];
+  const m = require('./monitors');
+  m.accumulate({ 'calls|a': 5 }, 100);
+  m.accumulate({ 'calls|a': 8 }, 100);          // +3
+  const st = m.accumulate({ 'calls|a': 2 }, 200); // restart: +2
+  assert.strictEqual(st.total['calls|a'], 10); assert.strictEqual(st.restarts, 1);
+  fs2.rmSync(dir, { recursive: true });
+  console.log('persistence tests passed');
+}

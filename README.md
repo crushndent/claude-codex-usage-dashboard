@@ -177,3 +177,12 @@ The page has tabs (deep-linkable as `#fuel`, `#activity`, `#local`, `#hindsight`
 2. **Local LLM** — LM Studio (`LMSTUDIO_URL`) loaded models, plus 1h/24h throughput and prompt-cache reuse parsed from llama.cpp timing lines in `~/.lmstudio/server-logs`. Also GPU utilization, VRAM by process, and power (`nvidia-smi`), with 24h sparklines that are sampled every minute and kept in memory.
 3. **Hindsight** — LLM calls and tokens by operation, operations, endpoints and DB pool, from Hindsight's Prometheus `/metrics` (no API key needed), plus `docker stats` for the container.
 4. **Headroom** — the Headroom dashboard embedded through a read-only GET proxy at `/hr/<instance>/…` (settings and other writes are blocked), so it also works over the tailnet.
+
+### Persistent history
+
+Everything is stored in `~/.local/share/llm-fuel/` (override with `LLM_FUEL_HISTORY_DIR`), so it survives dashboard restarts, the nightly headroom restart, Hindsight container restarts, and LM Studio log rotation:
+
+1. `series.jsonl` — per-minute GPU/VRAM/power/load, LM Studio completions, headroom request totals, Hindsight call totals. Kept 30 days; the Local LLM tab offers 24h / 7d / 30d views.
+2. `lm-requests.jsonl` + `lm-state.json` — one record per completed LM Studio request, plus the log file and byte offset to resume from (no re-reads or duplicates). Kept 30 days.
+3. `hindsight-counters.json` — running totals of Hindsight's Prometheus counters. A new container start is detected through `process_start_time_seconds`, and its counts are added on top. The Hindsight tab switches between "all time (saved)" and "this container run".
+4. `kilo-balance.jsonl` — Kilo balance snapshots (kept 90 days).

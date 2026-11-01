@@ -32,6 +32,29 @@ function run(cmd, args, timeout = 5000) {
 }
 const num = (v) => Number.isFinite(Number(v)) ? Number(v) : null;
 
+// ---------- Persistent store (~/.local/share/llm-fuel) so history survives restarts and log rotation ----------
+const STORE = process.env.LLM_FUEL_HISTORY_DIR || path.join(HOME, '.local', 'share', 'llm-fuel');
+const KEEP = { series: 30 * DAY, lm: 30 * DAY };
+const storePath = (name) => path.join(STORE, name);
+function readStoreJson(name, fallback) { try { return JSON.parse(fs.readFileSync(storePath(name), 'utf8')); } catch { return fallback; } }
+function writeStoreJson(name, value) {
+  try { fs.mkdirSync(STORE, { recursive: true }); const tmp = storePath(name + '.tmp'); fs.writeFileSync(tmp, JSON.stringify(value)); fs.renameSync(tmp, storePath(name)); } catch {}
+}
+function loadJsonl(name, since) {
+  let text = ''; try { text = fs.readFileSync(storePath(name), 'utf8'); } catch { return []; }
+  const out = []; for (const line of text.split('\n')) { if (!line) continue; try { const x = JSON.parse(line); if (x.t >= since) out.push(x); } catch {} }
+  return out;
+}
+function appendJsonl(name, rows) {
+  if (!rows.length) return;
+  try { fs.mkdirSync(STORE, { recursive: true }); fs.appendFileSync(storePath(name), rows.map((r) => JSON.stringify(r)).join('\n') + '\n'); } catch {}
+}
+function compactJsonl(name, keepMs) {
+  const rows = loadJsonl(name, Date.now() - keepMs);
+  try { const tmp = storePath(name + '.tmp'); fs.writeFileSync(tmp, rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length ? '\n' : '')); fs.renameSync(tmp, storePath(name)); } catch {}
+  return rows;
+}
+
 // ---------- Headroom ----------
 async function headroomInstance({ name, port }) {
   try {
@@ -145,20 +168,18 @@ async function gpu() {
   } catch (error) { return [{ error: error.message }]; }
 }
 // llama.cpp timing lines in LM Studio's server log -> one record per completed request.
-const lmLog = { file: null, offset: 0, rest: '', pending: {}, done: [] };
-function lmTodayLog() {
-  const d = new Date(); const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-  const dir = path.join(LMSTUDIO_LOGS, ym);
-  try { return fs.readdirSync(dir).filter((f) => f.endsWith('.log')).map((f) => path.join(dir, f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || null; } catch { return null; }
+// Completed requests are appended to lm-requests.jsonl; lm-state.json remembers how far into which log we have read.
+const lmLog = { file: null, offset: 0, rest: '', pending: {}, done: [], loaded: false };
+function lmLoad() {
+  if (lmLog.loaded) return; lmLog.loaded = true;
+  lmLog.done = compactJsonl('lm-requests.jsonl', KEEP.lm);
+  const st = readStoreJson('lm-state.json', null);
+  if (st?.file) Object.assign(lmLog, { file: st.file, offset: st.offset || 0 });
 }
-function scanLmLog() {
-  const file = lmTodayLog(); if (!file) return;
-  let size; try { size = fs.statSync(file).size; } catch { return; }
-  if (file !== lmLog.file || size < lmLog.offset) Object.assign(lmLog, { file, offset: Math.max(0, size - 8 * 1024 * 1024), rest: '', pending: {} });
-  if (size === lmLog.offset) return;
-  const fd = fs.openSync(file, 'r');
+function lmReadFrom(file, from, to) {
+  const fd = fs.openSync(file, 'r'); const added = [];
   try {
-    const buf = Buffer.alloc(size - lmLog.offset); fs.readSync(fd, buf, 0, buf.length, lmLog.offset); lmLog.offset = size;
+    const buf = Buffer.alloc(to - from); fs.readSync(fd, buf, 0, buf.length, from);
     const lines = (lmLog.rest + buf.toString('utf8')).split('\n'); lmLog.rest = lines.pop();
     let ts = Date.now(), model = null;
     for (const line of lines) {
@@ -171,12 +192,35 @@ function scanLmLog() {
       else if ((x = line.match(/\s eval time =\s*([\d.]+) ms \/\s*(\d+) tokens.*?([\d.]+) tokens per second/))) { p.genMs = +x[1]; p.genTokens = +x[2]; p.tgTps = +x[3]; }
       else if ((x = line.match(/stop processing: n_tokens = (\d+)/))) {
         p.ctxTokens = +x[1]; p.t = ts;
-        if (Number.isFinite(p.promptTokens)) { p.cachedTokens = Math.max(0, p.ctxTokens - p.promptTokens - (p.genTokens || 0)); lmLog.done.push(p); }
+        if (Number.isFinite(p.promptTokens)) { p.cachedTokens = Math.max(0, p.ctxTokens - p.promptTokens - (p.genTokens || 0)); added.push(p); }
         delete lmLog.pending[id];
       }
     }
   } finally { fs.closeSync(fd); }
-  const cut = Date.now() - DAY; lmLog.done = lmLog.done.filter((r) => r.t >= cut).slice(-5000);
+  return added;
+}
+function lmTodayLog() {
+  const d = new Date(); const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const dir = path.join(LMSTUDIO_LOGS, ym);
+  try { return fs.readdirSync(dir).filter((f) => f.endsWith('.log')).map((f) => path.join(dir, f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || null; } catch { return null; }
+}
+function scanLmLog() {
+  lmLoad();
+  const file = lmTodayLog(); if (!file) return;
+  let size; try { size = fs.statSync(file).size; } catch { return; }
+  const added = [];
+  if (file !== lmLog.file) {
+    // Log rotated (new day/file): finish the previous file, then start the new one from the top.
+    if (lmLog.file) { try { const old = fs.statSync(lmLog.file).size; if (old > lmLog.offset) added.push(...lmReadFrom(lmLog.file, lmLog.offset, old)); } catch {} }
+    Object.assign(lmLog, { file, offset: 0, rest: '', pending: {} });
+  } else if (size < lmLog.offset) Object.assign(lmLog, { offset: 0, rest: '', pending: {} });
+  if (size > lmLog.offset) { added.push(...lmReadFrom(file, lmLog.offset, size)); lmLog.offset = size; }
+  if (!added.length && size === lmLog.offset && lmLog.savedOffset === size) return;
+  lmLog.done.push(...added); appendJsonl('lm-requests.jsonl', added);
+  // Offset excludes the unfinished trailing line so it is re-read next time.
+  writeStoreJson('lm-state.json', { file: lmLog.file, offset: lmLog.offset - Buffer.byteLength(lmLog.rest) });
+  lmLog.savedOffset = size;
+  const cut = Date.now() - KEEP.lm; if (lmLog.done.length && lmLog.done[0].t < cut) lmLog.done = lmLog.done.filter((r) => r.t >= cut);
 }
 function lmSummary(windowMs) {
   const rs = lmLog.done.filter((r) => r.t >= Date.now() - windowMs);
@@ -198,7 +242,7 @@ async function localLlm() {
     lmstudio: { status: error ? 'down' : 'ok', error, url: LMSTUDIO_URL,
       loaded: models.filter((m) => m.state === 'loaded').map((m) => ({ id: m.id, type: m.type, ctx: m.loaded_context_length, maxCtx: m.max_context_length, quant: m.quantization, arch: m.arch })),
       available: models.length, vramMiB: lmProcs.reduce((a, p) => a + p.memMiB, 0) },
-    hour: lmSummary(HOUR), day: lmSummary(DAY),
+    hour: lmSummary(HOUR), day: lmSummary(DAY), week: lmSummary(7 * DAY), month: lmSummary(30 * DAY), trackedSince: lmLog.done[0]?.t ?? null,
     recent: lmLog.done.slice(-10).reverse().map((r) => ({ t: r.t, model: r.model, prompt: r.promptTokens, cached: r.cachedTokens, gen: r.genTokens, tg: r.tgTps, pp: r.ppTps, ms: (r.promptMs || 0) + (r.genMs || 0) })),
     gpus,
     host: { load: os.loadavg(), cpus: os.cpus().length, memUsed: os.totalmem() - os.freemem(), memTotal: os.totalmem() },
@@ -226,6 +270,21 @@ async function containerStats(name) {
   } catch { return null; }
 }
 let containerCache = { at: 0, data: null };
+// Prometheus counters reset when the container restarts. Fold each scrape into running totals kept in
+// hindsight-counters.json: same process start -> add the delta; new process start -> add the raw value.
+function accumulate(raw, start) {
+  const st = readStoreJson('hindsight-counters.json', null) || { since: Date.now(), start: null, last: {}, total: {} };
+  const restarted = st.start !== start;
+  for (const [k, v] of Object.entries(raw)) {
+    const prev = restarted ? 0 : (st.last[k] ?? 0);
+    st.total[k] = (st.total[k] || 0) + Math.max(0, v >= prev ? v - prev : v);
+  }
+  st.last = raw; st.start = start; st.restarts = (st.restarts || 0) + (restarted && st.lastSeen ? 1 : 0); st.lastSeen = Date.now();
+  writeStoreJson('hindsight-counters.json', st);
+  return st;
+}
+function flat(prefix, obj, into) { for (const [k, v] of Object.entries(obj)) into[`${prefix}|${k}`] = v; return into; }
+function unflat(total, prefix) { const o = {}; for (const [k, v] of Object.entries(total)) if (k.startsWith(prefix + '|')) o[k.slice(prefix.length + 1)] = v; return o; }
 async function hindsight() {
   try {
     const [health, metrics] = await Promise.all([getJson(`${HINDSIGHT_URL}/health`).catch((e) => ({ status: 'error', error: e.message })), get(`${HINDSIGHT_URL}/metrics`)]);
@@ -240,27 +299,49 @@ async function hindsight() {
     const errors = groupSum(rows, 'hindsight_http_requests_total', 'status_class', (l) => l.status_class !== '2xx');
     const models = groupSum(rows, 'hindsight_llm_calls_total', 'model');
     const one = (n) => rows.find((r) => r.name === n)?.value ?? null;
+    const raw = {}; flat('calls', calls, raw); flat('failed', failed, raw); flat('in', tin, raw); flat('out', tout, raw); flat('durSum', durSum, raw); flat('durCount', durCount, raw);
+    flat('op', ops, raw); flat('ep', endpoints, raw); flat('err', errors, raw); flat('model', models, raw);
+    raw['docs|all'] = rows.filter((r) => r.name === 'hindsight_retain_documents_total').reduce((a, r) => a + r.value, 0);
+    const acc = accumulate(raw, one('process_start_time_seconds'));
+    const T = (p) => unflat(acc.total, p);
+    const [tc, tf, ti, to, ts, tn] = ['calls', 'failed', 'in', 'out', 'durSum', 'durCount'].map(T);
+    const lifetime = { since: acc.since, restarts: acc.restarts || 0, operations: T('op'), models: T('model'), httpErrors: T('err'), retainedDocs: acc.total['docs|all'] || 0,
+      endpoints: Object.entries(T('ep')).sort((a, b) => b[1] - a[1]).slice(0, 10),
+      scopes: Object.keys({ ...tc, ...ti }).map((scope) => ({ scope, calls: tc[scope] || 0, failed: tf[scope] || 0, inTokens: ti[scope] || 0, outTokens: to[scope] || 0,
+        avgS: tn[scope] ? ts[scope] / tn[scope] : null })).sort((a, b) => b.calls - a.calls) };
     if (Date.now() - containerCache.at > 30000) containerCache = { at: Date.now(), data: await containerStats(process.env.HINDSIGHT_CONTAINER || 'hindsight') };
     const start = one('process_start_time_seconds');
     return { status: health.status === 'healthy' ? 'ok' : 'degraded', health, scopes, models, operations: ops,
       endpoints: Object.entries(endpoints).sort((a, b) => b[1] - a[1]).slice(0, 10), httpErrors: errors,
       retainedDocs: rows.filter((r) => r.name === 'hindsight_retain_documents_total').reduce((a, r) => a + r.value, 0),
       processMem: one('process_resident_memory_bytes'), uptimeS: start ? Date.now() / 1000 - start : null, container: containerCache.data,
-      ui: process.env.HINDSIGHT_UI || 'http://127.0.0.1:9999' };
+      ui: process.env.HINDSIGHT_UI || 'http://127.0.0.1:9999', lifetime };
   } catch (error) { return { status: 'down', error: error.message }; }
 }
 
-// ---------- Resource time series (sampled once a minute, kept 24h in memory) ----------
-const series = [];
+// ---------- Resource time series (sampled once a minute, appended to series.jsonl, 30 days kept) ----------
+let series = null;
+function loadSeries() { if (!series) series = compactJsonl('series.jsonl', KEEP.series); return series; }
 async function sample() {
   try {
+    loadSeries();
     const [g] = await gpu(); scanLmLog();
     const hr = await Promise.all(HEADROOM.map((i) => getJson(`http://127.0.0.1:${i.port}/stats`, 3000).then((s) => s.requests?.total ?? null).catch(() => null)));
-    series.push({ t: Date.now(), gpu: g?.util ?? null, vram: g?.memUsed ?? null, power: g?.power ?? null, load: os.loadavg()[0],
-      lm: lmLog.done.filter((r) => r.t >= Date.now() - 60000).length, hr });
-    const cut = Date.now() - DAY; while (series.length && series[0].t < cut) series.shift();
+    const hs = await hindsight(); // also folds Hindsight counters into the persistent totals every minute
+    const row = { t: Date.now(), gpu: g?.util ?? null, vram: g?.memUsed ?? null, power: g?.power ?? null, load: +os.loadavg()[0].toFixed(2),
+      lm: lmLog.done.filter((r) => r.t >= Date.now() - 60000).length, hr, hsCalls: hs.lifetime ? hs.lifetime.scopes.reduce((a, x) => a + x.calls, 0) : null };
+    series.push(row); appendJsonl('series.jsonl', [row]);
+    const cut = Date.now() - KEEP.series; while (series.length && series[0].t < cut) series.shift();
   } catch {}
 }
-function startSampling() { sample(); setInterval(sample, 60000).unref(); }
+function startSampling() {
+  sample(); setInterval(sample, 60000).unref();
+  setInterval(() => { series = compactJsonl('series.jsonl', KEEP.series); lmLog.done = compactJsonl('lm-requests.jsonl', KEEP.lm); }, DAY).unref();
+}
+function seriesWindow(ms) {
+  const rows = loadSeries().filter((r) => r.t >= Date.now() - ms);
+  const step = Math.max(1, Math.floor(rows.length / 720)); // cap ~720 points per chart
+  return step === 1 ? rows : rows.filter((_, i) => i % step === 0);
+}
 
-module.exports = { headroom, tools, localLlm, hindsight, series: () => series, startSampling, parseProm, HEADROOM };
+module.exports = { headroom, tools, localLlm, hindsight, series: seriesWindow, startSampling, parseProm, accumulate, STORE, HEADROOM };
