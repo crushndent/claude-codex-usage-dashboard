@@ -11,6 +11,7 @@ assert.strictEqual(p.weekly.remainingPercent, 30);
 const dashboard = fs.readFileSync(path.join(__dirname, 'dashboard.html'), 'utf8');
 assert.doesNotMatch(dashboard, /prewarm/i);
 assert.match(dashboard, /time left/);
+assert.match(dashboard, /data-tab="hindsight"/);
 console.log('tests passed');
 const { balanceTrend } = require('./server');
 const D = 86400000, now = 10 * D;
@@ -19,3 +20,7 @@ assert.strictEqual(t.startValue, 100); assert.strictEqual(t.spent, 25); assert.s
 assert.strictEqual(t.spentPercent, 25); assert.strictEqual(t.since, 3 * D);
 assert.strictEqual(balanceTrend([{ t: now, v: 5 }], now).spent, null);
 console.log('trend tests passed');
+const { parseProm } = require('./monitors');
+const rows = parseProm('# HELP x\nhindsight_llm_calls_total{scope="recall",success="true"} 3.0\nup 1\n');
+assert.strictEqual(rows[0].labels.scope, 'recall'); assert.strictEqual(rows[0].value, 3); assert.strictEqual(rows[1].name, 'up');
+console.log('monitor tests passed');

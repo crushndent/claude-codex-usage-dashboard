@@ -168,3 +168,12 @@ npm test
 Built from the MIT-licensed
 [frankchiu-dev/claude-codex-usage-dashboard](https://github.com/frankchiu-dev/claude-codex-usage-dashboard),
 then extended into a six-tool remaining-fuel dashboard. See `LICENSE`.
+
+## Monitoring tabs
+
+The page has tabs (deep-linkable as `#fuel`, `#activity`, `#local`, `#hindsight`, `#headroom`):
+
+1. **Activity** — each Headroom proxy (`HEADROOM_INSTANCES`, default `claude=8787,hermes=8788`): prompt-cache hit rate, requests, tokens, savings, latency, MCP results, recent requests. Also tool and MCP call counts for the last 24h, parsed from Claude Code transcripts (`TRANSCRIPT_ROOTS`) and Codex sessions (`CODEX_ROOTS`).
+2. **Local LLM** — LM Studio (`LMSTUDIO_URL`) loaded models, plus 1h/24h throughput and prompt-cache reuse parsed from llama.cpp timing lines in `~/.lmstudio/server-logs`. Also GPU utilization, VRAM by process, and power (`nvidia-smi`), with 24h sparklines that are sampled every minute and kept in memory.
+3. **Hindsight** — LLM calls and tokens by operation, operations, endpoints and DB pool, from Hindsight's Prometheus `/metrics` (no API key needed), plus `docker stats` for the container.
+4. **Headroom** — the Headroom dashboard embedded through a read-only GET proxy at `/hr/<instance>/…` (settings and other writes are blocked), so it also works over the tailnet.

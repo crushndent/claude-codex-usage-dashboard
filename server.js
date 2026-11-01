@@ -358,10 +358,45 @@ async function usage() {
 }
 
 function html() { return fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8'); }
+const monitors = require('./monitors');
+const memo = new Map();
+async function cached(key, ms, fn) {
+  const hit = memo.get(key); if (hit && Date.now() - hit.at < ms) return hit.data;
+  const data = await fn(); memo.set(key, { at: Date.now(), data }); return data;
+}
+const api = {
+  '/api/usage': usage,
+  '/api/activity': () => cached('activity', 8000, async () => ({ generatedAt: Date.now(), headroom: await monitors.headroom(), tools: monitors.tools() })),
+  '/api/local': () => cached('local', 5000, async () => ({ generatedAt: Date.now(), ...await monitors.localLlm(), series: monitors.series() })),
+  '/api/hindsight': () => cached('hindsight', 8000, async () => ({ generatedAt: Date.now(), ...await monitors.hindsight() })),
+};
+// Read-only proxy so each headroom dashboard can sit in a tab (works over the tailnet too, where 127.0.0.1 would not).
+const HR_PATHS = /^\/(dashboard(\/static\/[\w.-]+)?|stats|stats-history|stats-lifetime|health|transformations\/feed)(\?.*)?$/;
+function proxyHeadroom(req, res, port, rest) {
+  if (req.method !== 'GET' || !HR_PATHS.test(rest)) { res.writeHead(403); return res.end('Read-only headroom view'); }
+  const prefix = req.url.slice(0, req.url.length - rest.length);
+  http.get({ host: '127.0.0.1', port, path: rest, timeout: 10000 }, (up) => {
+    const type = up.headers['content-type'] || '';
+    if (!type.includes('text/html')) { res.writeHead(up.statusCode, { 'Content-Type': type, 'Cache-Control': 'no-store' }); return up.pipe(res); }
+    let body = ''; up.setEncoding('utf8'); up.on('data', (c) => { body += c; });
+    up.on('end', () => {
+      body = body.replace(/(["'`(])\/(dashboard|stats|health|transformations)/g, `$1${prefix}/$2`);
+      res.writeHead(up.statusCode, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(body);
+    });
+  }).on('error', (e) => { res.writeHead(502); res.end(`headroom :${port} unreachable: ${e.message}`); });
+}
 const server = http.createServer(async (req, res) => {
-  if (req.url === '/api/usage') {
+  const route = req.url.split('?')[0];
+  if (api[route]) {
+    let data; try { data = await api[route](); } catch (e) { data = { error: e.message }; }
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify(await usage()));
+    return res.end(JSON.stringify(data));
+  }
+  const hr = req.url.match(/^\/hr\/([\w-]+)(\/.*)$/);
+  if (hr) {
+    const inst = monitors.HEADROOM.find((i) => i.name === hr[1]);
+    if (!inst) { res.writeHead(404); return res.end('unknown headroom instance'); }
+    return proxyHeadroom(req, res, inst.port, hr[2]);
   }
   if (req.url === '/' || req.url.startsWith('/?')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(html());
@@ -373,5 +408,6 @@ if (require.main === module) {
   // Keep sampling balances even when no dashboard tab is open.
   const sample = () => readKilo({}).catch(() => {});
   sample(); setInterval(sample, SAMPLE_MS).unref();
+  monitors.startSampling();
 }
 module.exports = { quotaWindow, quotaProvider, readCodex, usage, server, balanceTrend };
